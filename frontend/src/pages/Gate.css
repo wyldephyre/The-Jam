@@ -1,0 +1,127 @@
+.gate-container {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  overflow: hidden;
+}
+
+.gate-bg-effects {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.gate-orb {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(80px);
+}
+
+.gate-orb-1 {
+  width: 400px;
+  height: 400px;
+  background: var(--primary);
+  opacity: 0.15;
+  top: -100px;
+  left: -100px;
+  animation: float 8s ease-in-out infinite;
+}
+
+.gate-orb-2 {
+  width: 300px;
+  height: 300px;
+  background: var(--secondary);
+  opacity: 0.1;
+  bottom: -50px;
+  right: -50px;
+  animation: float 10s ease-in-out infinite reverse;
+}
+
+@keyframes float {
+  0%, 100% { transform: translate(0, 0); }
+  50% { transform: translate(30px, 30px); }
+}
+
+.gate-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 3rem;
+  width: 100%;
+  max-width: 400px;
+  text-align: center;
+  position: relative;
+  z-index: 1;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+
+.gate-logo {
+  font-family: 'Orbitron', sans-serif;
+  font-size: 2.5rem;
+  font-weight: 900;
+  margin-bottom: 0.5rem;
+  display: flex;
+  justify-content: center;
+  gap: 0.5rem;
+}
+
+.logo-wylde {
+  color: var(--text);
+}
+
+.logo-phyre {
+  background: linear-gradient(135deg, var(--primary), var(--primary-glow));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.gate-subtitle {
+  color: var(--text-muted);
+  font-size: 1rem;
+  font-weight: 400;
+  margin-bottom: 2rem;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+}
+
+.gate-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.gate-input {
+  text-align: center;
+  font-size: 1.1rem;
+  padding: 1rem;
+}
+
+.gate-btn {
+  width: 100%;
+  padding: 1rem;
+  font-size: 1.1rem;
+}
+
+.gate-error {
+  color: var(--danger);
+  font-size: 0.9rem;
+}
+
+.gate-admin-link {
+  margin-top: 2rem;
+  font-size: 0.85rem;
+}
+
+.gate-admin-link a {
+  color: var(--text-muted);
+  text-decoration: none;
+  transition: color 0.2s;
+}
+
+.gate-admin-link a:hover {
+  color: var(--secondary);
+}
+

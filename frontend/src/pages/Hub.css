@@ -1,0 +1,269 @@
+.hub-container {
+  min-height: 100vh;
+  padding: 1rem;
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+.hub-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1rem 0;
+  margin-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.hub-logo {
+  font-family: 'Orbitron', sans-serif;
+  font-size: 1.5rem;
+  font-weight: 700;
+  display: flex;
+  gap: 0.3rem;
+}
+
+.hub-user-info {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.username {
+  color: var(--text-muted);
+}
+
+.time-badge {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  padding: 0.25rem 0.75rem;
+  border-radius: 20px;
+  font-size: 0.8rem;
+  color: var(--secondary);
+}
+
+.feedback {
+  padding: 1rem;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.feedback-success {
+  background: rgba(0, 255, 136, 0.1);
+  border: 1px solid var(--success);
+  color: var(--success);
+}
+
+.feedback-info {
+  background: rgba(0, 212, 255, 0.1);
+  border: 1px solid var(--secondary);
+  color: var(--secondary);
+}
+
+.feedback-error {
+  background: rgba(255, 68, 68, 0.1);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+}
+
+.feedback button {
+  background: none;
+  border: none;
+  color: inherit;
+  font-size: 1.5rem;
+  cursor: pointer;
+  padding: 0 0.5rem;
+}
+
+.hub-tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.tab {
+  flex: 1;
+  padding: 0.75rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-muted);
+  font-size: 1rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.tab.active {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: white;
+}
+
+.tab:hover:not(.active) {
+  border-color: var(--primary);
+  color: var(--text);
+}
+
+.request-section {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.search-card h3,
+.message-card h3 {
+  margin-bottom: 1rem;
+  font-size: 1.1rem;
+}
+
+.search-form {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.search-form .input {
+  flex: 1;
+}
+
+.search-results {
+  margin-top: 1rem;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.track-item {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.75rem;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.track-item:hover {
+  background: var(--bg-card-hover);
+}
+
+.track-item.selected {
+  background: rgba(255, 77, 0, 0.15);
+  border: 1px solid var(--primary);
+}
+
+.track-art {
+  width: 48px;
+  height: 48px;
+  border-radius: 4px;
+  object-fit: cover;
+}
+
+.track-info {
+  display: flex;
+  flex-direction: column;
+}
+
+.track-name {
+  font-weight: 600;
+}
+
+.track-artist {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.selected-track {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+.message-input {
+  resize: vertical;
+  min-height: 80px;
+  margin-bottom: 1rem;
+}
+
+.feed-section .card h3 {
+  margin-bottom: 1rem;
+}
+
+.empty-state {
+  color: var(--text-muted);
+  text-align: center;
+  padding: 2rem;
+}
+
+.feed-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.feed-item {
+  display: flex;
+  gap: 0.75rem;
+  padding: 0.75rem;
+  background: var(--bg-dark);
+  border-radius: 8px;
+}
+
+.feed-type {
+  font-size: 1.25rem;
+}
+
+.feed-content {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.feed-text {
+  font-weight: 500;
+}
+
+.feed-artist {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.feed-user {
+  font-size: 0.8rem;
+  color: var(--secondary);
+}
+
+.username-prompt {
+  max-width: 400px;
+  margin: 0 auto;
+  margin-top: 20vh;
+  text-align: center;
+}
+
+.username-prompt h2 {
+  margin-bottom: 0.5rem;
+}
+
+.username-prompt p {
+  color: var(--text-muted);
+  margin-bottom: 1.5rem;
+}
+
+.username-prompt .input {
+  margin-bottom: 1rem;
+}
+
+.username-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.username-actions button {
+  flex: 1;
+}
+
