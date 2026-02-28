@@ -1,0 +1,11 @@
+{
+  "name": "the-jam",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "bun run --hot index.tsx",
+    "start": "bun run index.tsx"
+  },
+  "dependencies": {
+    "hono": "^4.6.0"
+  }
+}

@@ -1,0 +1,12 @@
+# The Jam — WyldePhyre Viewer Hub
+
+Single-file Zo site. Stack: Hono + Bun + SQLite + SSE.
+
+- index.tsx: All routes and HTML page rendering
+- db.ts: SQLite database (viewers, requests, overlay tables)
+- spotify.ts: Spotify Web API (token refresh, search, queue)
+- sse.ts: Server-Sent Events broadcast for real-time feed
+
+API routes all start with /api. Three frontend pages: / (gate), /hub, /admin.
+Auth uses x-viewer-password and x-admin-password headers (env vars).
+Real-time updates are delivered via GET /api/events (SSE).
