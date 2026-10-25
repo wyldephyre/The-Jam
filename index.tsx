@@ -20,6 +20,22 @@ import { searchTracks, addToQueue } from "./spotify";
 import { addClient, removeClient, broadcast } from "./sse";
 import { htmlPage, GATE_BODY, GATE_SCRIPT, HUB_BODY, HUB_SCRIPT, ADMIN_BODY, ADMIN_SCRIPT } from "./pages";
 
+// Refuse to start without both passwords. An unset/empty password must never
+// mean "no password needed".
+const VIEWER_PASSWORD = process.env.VIEWER_PASSWORD ?? "";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ?? "";
+const missingEnv = [
+  !VIEWER_PASSWORD.trim() && "VIEWER_PASSWORD",
+  !ADMIN_PASSWORD.trim() && "ADMIN_PASSWORD",
+].filter(Boolean);
+if (missingEnv.length > 0) {
+  console.error(
+    `FATAL: ${missingEnv.join(" and ")} must be set to a non-empty value. ` +
+      "Refusing to start without passwords. Copy .env.example and fill them in."
+  );
+  process.exit(1);
+}
+
 const app = new Hono();
 const PORT = parseInt(process.env.PORT || "3000");
 const REGULAR_THRESHOLD = parseInt(process.env.REGULAR_THRESHOLD_MINUTES || "18000", 10);
@@ -29,18 +45,64 @@ function viewerToJson(v: Viewer) {
 }
 
 import type { Context, Next } from "hono";
+import { createHash, timingSafeEqual } from "node:crypto";
+
+// Constant-time compare. Anything that is not a string (e.g. a missing header) never matches.
+function passwordMatches(given: unknown, expected: string): boolean {
+  if (typeof given !== "string" || given.length === 0 || expected.length === 0) return false;
+  const a = createHash("sha256").update(given).digest();
+  const b = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(a, b);
+}
+
+// ---- Input validation helpers -------------------------------------------
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SPOTIFY_TRACK_URI_RE = /^spotify:track:[A-Za-z0-9]{1,64}$/;
+const MAX_USERNAME = 30;
+const MAX_MESSAGE = 500;
+const MAX_SONG_FIELD = 200;
+
+type Body = Record<string, unknown>;
+
+// Returns the parsed JSON object, or null if the body is missing, not JSON, or not an object.
+async function readJson(c: Context): Promise<Body | null> {
+  try {
+    const body = await c.req.json();
+    return body && typeof body === "object" && !Array.isArray(body) ? (body as Body) : null;
+  } catch {
+    return null;
+  }
+}
+
+const badBody = (c: Context) => c.json({ error: "Invalid JSON body" }, 400);
+
+function cleanViewerId(v: unknown): string | null {
+  return typeof v === "string" && UUID_RE.test(v) ? v.toLowerCase() : null;
+}
+
+// Single-line text: control characters (incl. newlines) become spaces, trimmed, 1..max chars.
+function cleanLine(v: unknown, max: number): string | null {
+  if (typeof v !== "string") return null;
+  const s = v.replace(/[\u0000-\u001F\u007F]+/g, " ").trim();
+  return s.length >= 1 && s.length <= max ? s : null;
+}
+
+// Multi-line text (messages): drop control characters except tab/newline, trimmed, 1..max chars.
+function cleanMessage(v: unknown, max: number): string | null {
+  if (typeof v !== "string") return null;
+  const s = v.replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "").trim();
+  return s.length >= 1 && s.length <= max ? s : null;
+}
 
 async function viewerAuth(c: Context, next: Next) {
-  const password = c.req.header("x-viewer-password");
-  if (password !== process.env.VIEWER_PASSWORD) {
+  if (!passwordMatches(c.req.header("x-viewer-password"), VIEWER_PASSWORD)) {
     return c.json({ error: "Invalid password" }, 401);
   }
   await next();
 }
 
 async function adminAuth(c: Context, next: Next) {
-  const password = c.req.header("x-admin-password");
-  if (password !== process.env.ADMIN_PASSWORD) {
+  if (!passwordMatches(c.req.header("x-admin-password"), ADMIN_PASSWORD)) {
     return c.json({ error: "Invalid admin password" }, 401);
   }
   await next();
@@ -48,12 +110,13 @@ async function adminAuth(c: Context, next: Next) {
 
 // Auth
 app.post("/api/auth/verify", async (c) => {
-  const body = (await c.req.json()) as { password?: string; type?: string };
+  const body = await readJson(c);
+  if (!body) return badBody(c);
   const { password, type } = body;
-  if (type === "viewer" && password === process.env.VIEWER_PASSWORD) {
+  if (type === "viewer" && passwordMatches(password, VIEWER_PASSWORD)) {
     return c.json({ valid: true });
   }
-  if (type === "admin" && password === process.env.ADMIN_PASSWORD) {
+  if (type === "admin" && passwordMatches(password, ADMIN_PASSWORD)) {
     return c.json({ valid: true });
   }
   return c.json({ valid: false, error: "Invalid password" }, 401);
@@ -61,9 +124,10 @@ app.post("/api/auth/verify", async (c) => {
 
 // Time
 app.post("/api/time/log", viewerAuth, async (c) => {
-  const body = (await c.req.json()) as { viewerId?: string };
-  const viewerId = body.viewerId;
-  if (!viewerId) return c.json({ error: "viewerId required" }, 400);
+  const body = await readJson(c);
+  if (!body) return badBody(c);
+  const viewerId = cleanViewerId(body.viewerId);
+  if (!viewerId) return c.json({ error: "valid viewerId (UUID) required" }, 400);
   const before = getViewer(viewerId);
   const viewer = upsertViewer(viewerId, 1, REGULAR_THRESHOLD);
   const promoted = !!(before && !before.is_regular && viewer.is_regular);
@@ -75,15 +139,20 @@ app.post("/api/time/log", viewerAuth, async (c) => {
 });
 
 app.post("/api/time/set-username", viewerAuth, async (c) => {
-  const body = (await c.req.json()) as { viewerId?: string; username?: string };
-  const { viewerId, username } = body;
-  if (!viewerId || !username) return c.json({ error: "viewerId and username required" }, 400);
+  const body = await readJson(c);
+  if (!body) return badBody(c);
+  const viewerId = cleanViewerId(body.viewerId);
+  if (!viewerId) return c.json({ error: "valid viewerId (UUID) required" }, 400);
+  const username = cleanLine(body.username, MAX_USERNAME);
+  if (!username) return c.json({ error: `username required (1-${MAX_USERNAME} characters)` }, 400);
   const viewer = setViewerUsername(viewerId, username);
   return c.json({ viewer: viewerToJson(viewer) });
 });
 
 app.get("/api/time/viewer/:id", viewerAuth, (c) => {
-  const viewer = getViewer(c.req.param("id"));
+  const viewerId = cleanViewerId(c.req.param("id"));
+  if (!viewerId) return c.json({ error: "valid viewerId (UUID) required" }, 400);
+  const viewer = getViewer(viewerId);
   return c.json({ viewer: viewer ? viewerToJson(viewer) : null });
 });
 
@@ -101,26 +170,43 @@ app.get("/api/requests/search", viewerAuth, async (c) => {
 });
 
 app.post("/api/requests/submit", viewerAuth, async (c) => {
-  const body = (await c.req.json()) as {
-    viewerId?: string;
-    type?: string;
-    content?: string;
-    spotifyUri?: string | null;
-    artist?: string | null;
-  };
-  const { viewerId, type, content, spotifyUri, artist } = body;
-  if (!viewerId || !type || !content) {
-    return c.json({ error: "viewerId, type, and content required" }, 400);
+  const body = await readJson(c);
+  if (!body) return badBody(c);
+  const viewerId = cleanViewerId(body.viewerId);
+  if (!viewerId) return c.json({ error: "valid viewerId (UUID) required" }, 400);
+  const type = body.type;
+  if (type !== "song" && type !== "message") {
+    return c.json({ error: 'type must be "song" or "message"' }, 400);
+  }
+  let content: string | null;
+  let artist: string | null = null;
+  let spotifyUri: string | null = null;
+  if (type === "message") {
+    content = cleanMessage(body.content, MAX_MESSAGE);
+    if (!content) return c.json({ error: `message required (1-${MAX_MESSAGE} characters)` }, 400);
+  } else {
+    content = cleanLine(body.content, MAX_SONG_FIELD);
+    if (!content) return c.json({ error: `song title required (1-${MAX_SONG_FIELD} characters)` }, 400);
+    if (body.artist != null && body.artist !== "") {
+      artist = cleanLine(body.artist, MAX_SONG_FIELD);
+      if (!artist) return c.json({ error: `artist must be 1-${MAX_SONG_FIELD} characters` }, 400);
+    }
+    if (body.spotifyUri != null && body.spotifyUri !== "") {
+      if (typeof body.spotifyUri !== "string" || !SPOTIFY_TRACK_URI_RE.test(body.spotifyUri)) {
+        return c.json({ error: "spotifyUri must look like spotify:track:<id>" }, 400);
+      }
+      spotifyUri = body.spotifyUri;
+    }
   }
   const viewer = getViewer(viewerId);
   const isRegular = viewer ? Boolean(viewer.is_regular) : false;
   const status = isRegular && type === "song" ? "approved" : "pending";
   const request = insertRequest({
     viewer_id: viewerId,
-    type: type as "song" | "message",
+    type,
     content,
-    spotify_uri: spotifyUri ?? null,
-    artist: artist ?? null,
+    spotify_uri: spotifyUri,
+    artist,
     status: status as "pending" | "approved" | "rejected",
   });
   if (status === "approved" && type === "song" && spotifyUri) {
