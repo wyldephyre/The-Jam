@@ -20,6 +20,16 @@ ${body}
 </html>`;
 }
 
+// One HTML-escape helper for every viewer-supplied string that is rendered as HTML.
+// Escapes & < > " ' so it is safe in text nodes AND in quoted attribute values.
+export const ESC_JS = `
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+`;
+
 export const GATE_BODY = `
 <div class="gate-container">
   <div class="gate-bg-effects">
@@ -148,7 +158,7 @@ export const HUB_BODY = `
   </div>
 </div>`;
 
-export const HUB_SCRIPT = `
+export const HUB_SCRIPT = ESC_JS + `
 function formatTime(m) {
   var h = Math.floor(m / 60), mins = m % 60;
   return h > 0 ? h + 'h ' + mins + 'm' : mins + 'm';
@@ -195,7 +205,7 @@ function getViewerHeaders() {
     empty.style.display = 'none';
     list.style.display = 'block';
     list.innerHTML = state.approvedRequests.slice(0, 50).map(function(req) {
-      return '<div class="feed-item"><span class="feed-type">' + (req.type === 'song' ? '&#127925;' : '&#128172;') + '</span><div class="feed-content"><span class="feed-text">' + (req.content || '').replace(/</g,'&lt;') + '</span>' + (req.artist ? '<span class="feed-artist">by ' + (req.artist || '').replace(/</g,'&lt;') + '</span>' : '') + '<span class="feed-user">— ' + (req.viewer && req.viewer.username ? (req.viewer.username).replace(/</g,'&lt;') : 'Anonymous') + '</span></div></div>';
+      return '<div class="feed-item"><span class="feed-type">' + (req.type === 'song' ? '&#127925;' : '&#128172;') + '</span><div class="feed-content"><span class="feed-text">' + esc(req.content || '') + '</span>' + (req.artist ? '<span class="feed-artist">by ' + esc(req.artist || '') + '</span>' : '') + '<span class="feed-user">— ' + esc(req.viewer && req.viewer.username ? req.viewer.username : 'Anonymous') + '</span></div></div>';
     }).join('');
   }
   loadViewer();
@@ -254,7 +264,7 @@ function getViewerHeaders() {
     fetch('/api/requests/search?q=' + encodeURIComponent(q), { headers: getViewerHeaders() }).then(function(r) { return r.json(); }).then(function(data) {
       var res = document.getElementById('search-results');
       res.innerHTML = (data.tracks || []).map(function(t) {
-        return '<div class="track-item" data-uri="' + (t.uri||'').replace(/"/g,'&quot;') + '" data-name="' + (t.name||'').replace(/"/g,'&quot;') + '" data-artist="' + (t.artist||'').replace(/"/g,'&quot;') + '"><img src="' + (t.albumArt || '').replace(/"/g,'&quot;') + '" alt="" class="track-art" onerror="this.style.display=\\'none\\'"/><div class="track-info"><span class="track-name">' + (t.name||'').replace(/</g,'&lt;') + '</span><span class="track-artist">' + (t.artist||'').replace(/</g,'&lt;') + '</span></div></div>';
+        return '<div class="track-item" data-uri="' + esc(t.uri||'') + '" data-name="' + esc(t.name||'') + '" data-artist="' + esc(t.artist||'') + '"><img src="' + esc(t.albumArt || '') + '" alt="" class="track-art" onerror="this.style.display=\\'none\\'"/><div class="track-info"><span class="track-name">' + esc(t.name||'') + '</span><span class="track-artist">' + esc(t.artist||'') + '</span></div></div>';
       }).join('');
       res.querySelectorAll('.track-item').forEach(function(el) {
         el.onclick = function() {
@@ -344,7 +354,7 @@ export const ADMIN_BODY = `
   </main>
 </div>`;
 
-export const ADMIN_SCRIPT = `
+export const ADMIN_SCRIPT = ESC_JS + `
 function getAdminHeaders() {
   return { 'Content-Type': 'application/json', 'x-admin-password': sessionStorage.getItem('adminPassword') };
 }
@@ -369,7 +379,7 @@ function formatDate(s) { return new Date(s).toLocaleString(); }
         document.getElementById('admin-viewers-wrap').style.display = 'block';
         var tbody = document.getElementById('admin-viewers-tbody');
         tbody.innerHTML = state.viewers.map(function(v) {
-          return '<tr><td>' + (v.username || 'Anonymous').replace(/</g,'&lt;') + '</td><td>' + formatTime(v.total_minutes || 0) + '</td><td><span class="badge ' + (v.is_regular ? 'badge-regular">Regular' : 'badge-pending">New') + '</span></td><td>' + formatDate(v.created_at) + '</td><td><button type="button" class="btn btn-sm ' + (v.is_regular ? 'btn-danger' : 'btn-success') + '" data-id="' + v.id + '">' + (v.is_regular ? 'Demote' : 'Promote') + '</button></td></tr>';
+          return '<tr><td>' + esc(v.username || 'Anonymous') + '</td><td>' + formatTime(v.total_minutes || 0) + '</td><td><span class="badge ' + (v.is_regular ? 'badge-regular">Regular' : 'badge-pending">New') + '</span></td><td>' + esc(formatDate(v.created_at)) + '</td><td><button type="button" class="btn btn-sm ' + (v.is_regular ? 'btn-danger' : 'btn-success') + '" data-id="' + esc(v.id) + '">' + (v.is_regular ? 'Demote' : 'Promote') + '</button></td></tr>';
         }).join('');
         tbody.querySelectorAll('button').forEach(function(btn) {
           btn.onclick = function() {
@@ -405,8 +415,8 @@ function formatDate(s) { return new Date(s).toLocaleString(); }
         }
         empty.style.display = 'none';
         list.innerHTML = state.requests.map(function(req) {
-          var actions = req.status === 'pending' ? '<div class="request-actions"><button type="button" class="btn btn-success admin-approve" data-id="' + req.id + '">Approve</button><button type="button" class="btn btn-danger admin-reject" data-id="' + req.id + '">Reject</button></div>' : '';
-          return '<div class="request-card"><div class="request-header"><span class="request-type">' + (req.type === 'song' ? '&#127925; Song' : '&#128172; Message') + '</span><span class="badge badge-' + req.status + '">' + req.status + '</span></div><div class="request-content"><p class="request-text">' + (req.content||'').replace(/</g,'&lt;') + '</p>' + (req.artist ? '<p class="request-artist">by ' + (req.artist||'').replace(/</g,'&lt;') + '</p>' : '') + '</div><div class="request-meta"><span>From: ' + (req.viewer && req.viewer.username ? (req.viewer.username).replace(/</g,'&lt;') : 'Anonymous') + '</span><span>' + formatDate(req.created_at) + '</span></div>' + actions + '</div>';
+          var actions = req.status === 'pending' ? '<div class="request-actions"><button type="button" class="btn btn-success admin-approve" data-id="' + esc(req.id) + '">Approve</button><button type="button" class="btn btn-danger admin-reject" data-id="' + esc(req.id) + '">Reject</button></div>' : '';
+          return '<div class="request-card"><div class="request-header"><span class="request-type">' + (req.type === 'song' ? '&#127925; Song' : '&#128172; Message') + '</span><span class="badge badge-' + esc(req.status) + '">' + esc(req.status) + '</span></div><div class="request-content"><p class="request-text">' + esc(req.content||'') + '</p>' + (req.artist ? '<p class="request-artist">by ' + esc(req.artist||'') + '</p>' : '') + '</div><div class="request-meta"><span>From: ' + esc(req.viewer && req.viewer.username ? req.viewer.username : 'Anonymous') + '</span><span>' + esc(formatDate(req.created_at)) + '</span></div>' + actions + '</div>';
         }).join('');
         list.querySelectorAll('.admin-approve').forEach(function(btn) {
           btn.onclick = function() {
