@@ -117,6 +117,7 @@ export function upsertViewer(id: string, minutesToAdd: number, threshold: number
 }
 
 export function setViewerUsername(id: string, username: string): Viewer {
+  db.run("INSERT OR IGNORE INTO viewers (id, total_minutes) VALUES (?, 0)", [id]);
   db.run("UPDATE viewers SET username = ?, updated_at = datetime('now') WHERE id = ?", [username, id]);
   const row = db.query("SELECT * FROM viewers WHERE id = ?").get(id) as Record<string, unknown>;
   return rowToViewer(row);
