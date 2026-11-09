@@ -31,6 +31,233 @@ class Plan:
     commit: bool
 
 
+# Nose offset perpendicular to the eye line, in units of eye distance.
+# This is a 2D image measurement with roll removed. It is not world pitch
+# and not eye gaze. The sign depends on where the camera sits, so only a
+# calibration of the chat pose against the lens pose may use it as a gate.
+MIN_PITCH_SEPARATION = 0.15
+TRIGGER_PROGRESS = 0.65
+MIN_CALIBRATION_FRAMES = 5
+
+
+@dataclass
+class PitchGate:
+    chat_pitch: float
+    lens_pitch: float
+    valid: bool
+    reason: str
+    trigger_progress: float = TRIGGER_PROGRESS
+    min_separation: float = MIN_PITCH_SEPARATION
+
+    def progress(self, pitch: float) -> float | None:
+        number = _finite(pitch)
+        if number is None or not self.valid:
+            return None
+        span = self.lens_pitch - self.chat_pitch
+        if abs(span) < 1e-9:
+            return None
+        return (number - self.chat_pitch) / span
+
+    def allows(self, pitch) -> bool:
+        prog = self.progress(pitch) if self.valid else None
+        if prog is None:
+            return False
+        return prog >= self.trigger_progress - 1e-9
+
+
+def pitch_proxy(nose, left_eye, right_eye) -> float | None:
+    """Component of (nose - eye midpoint) along the chin side of the eye line.
+
+    Positive means the nose sits to the chin side of the eyes in the image
+    after in-plane roll is removed. A horizontal nose shift does not change it.
+    Callers must not treat the sign as "looking up" until calibration says so.
+    """
+    try:
+        nx, ny = float(nose[0]), float(nose[1])
+        lx, ly = float(left_eye[0]), float(left_eye[1])
+        rx, ry = float(right_eye[0]), float(right_eye[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    ex, ey = rx - lx, ry - ly
+    eye_dist_sq = ex * ex + ey * ey
+    if eye_dist_sq < 1e-6:
+        return None
+    # Map the left-to-right eye vector onto the image-down side of that line.
+    px, py = -ey, ex
+    vx, vy = nx - (lx + rx) / 2.0, ny - (ly + ry) / 2.0
+    return (vx * px + vy * py) / eye_dist_sq
+
+
+def pitch_proxy_from_person(person, min_conf: float) -> float | None:
+    if not person:
+        return None
+    try:
+        kpts = person["kpts"]
+        nose = kpts[0]
+        left_eye = kpts[1]
+        right_eye = kpts[2]
+        confs = (float(nose[2]), float(left_eye[2]), float(right_eye[2]))
+    except (KeyError, TypeError, ValueError, IndexError):
+        return None
+    if min(confs) < float(min_conf):
+        return None
+    return pitch_proxy(nose, left_eye, right_eye)
+
+
+def fit_pitch_gate(
+    chat_samples,
+    lens_samples,
+    *,
+    min_frames: int = MIN_CALIBRATION_FRAMES,
+    min_separation: float = MIN_PITCH_SEPARATION,
+    trigger_progress: float = TRIGGER_PROGRESS,
+) -> PitchGate:
+    chat = [v for v in chat_samples if _finite(v) is not None]
+    lens = [v for v in lens_samples if _finite(v) is not None]
+    if len(chat) < min_frames:
+        return _invalid_gate(
+            f"Chat pose kept {len(chat)} confident frames; need at least {min_frames}. "
+            "Hold the chat-reading head turn during the one-second capture and run "
+            "-Calibrate again. calibration.yaml was not written. Automatic cutaways "
+            "stay off. No scene change was made."
+        )
+    if len(lens) < min_frames:
+        return _invalid_gate(
+            f"Lens pose kept {len(lens)} confident frames; need at least {min_frames}. "
+            "Look up into the C920 and hold through the capture. calibration.yaml was "
+            "not written. Automatic cutaways stay off. No scene change was made."
+        )
+    chat_pitch = _median(chat)
+    lens_pitch = _median(lens)
+    separation = abs(lens_pitch - chat_pitch)
+    if separation < min_separation:
+        return _invalid_gate(
+            f"Chat pitch_proxy {chat_pitch:.2f} and lens pitch_proxy {lens_pitch:.2f} "
+            f"differ by {separation:.2f} (need at least {min_separation:.2f} eye-distances). "
+            "Those two poses look too similar on this camera, so a gate would not separate "
+            "reading chat from looking into the lens. calibration.yaml was not written. "
+            "Redo calibration with a normal chat turn, then a clear look up into the C920. "
+            "Automatic cutaways stay off. No scene change was made."
+        )
+    return PitchGate(
+        chat_pitch,
+        lens_pitch,
+        True,
+        "",
+        float(trigger_progress),
+        float(min_separation),
+    )
+
+
+def pitch_gate_from_mapping(data) -> PitchGate:
+    if not isinstance(data, dict) or data.get("version") != 1:
+        return _invalid_gate(
+            "calibration.yaml is missing or is not version 1. Run .\\run.ps1 -Calibrate. "
+            "Automatic cutaways stay off. No scene change was made."
+        )
+    if data.get("feature") not in (None, "eye_line_pitch_proxy"):
+        return _invalid_gate(
+            "calibration.yaml uses an unknown feature. Run .\\run.ps1 -Calibrate. "
+            "Automatic cutaways stay off. No scene change was made."
+        )
+    if data.get("feature") is None:
+        return _invalid_gate(
+            "calibration.yaml has no feature: eye_line_pitch_proxy entry. "
+            "Run .\\run.ps1 -Calibrate. Automatic cutaways stay off. No scene change was made."
+        )
+    chat = _finite(data.get("chat_pitch"))
+    lens = _finite(data.get("lens_pitch"))
+    if chat is None or lens is None:
+        return _invalid_gate(
+            "calibration.yaml is missing numeric chat_pitch or lens_pitch. "
+            "Run .\\run.ps1 -Calibrate. Automatic cutaways stay off. No scene change was made."
+        )
+    # Ignore any trigger_progress stored in the file. A hand edit must not lower the bar.
+    separation = abs(lens - chat)
+    if separation < MIN_PITCH_SEPARATION:
+        return _invalid_gate(
+            f"Saved calibration separates chat ({chat:.2f}) and lens ({lens:.2f}) by only "
+            f"{separation:.2f}, under {MIN_PITCH_SEPARATION:.2f}. Automatic cutaways stay off. "
+            "Run .\\run.ps1 -Calibrate again. No scene change was made."
+        )
+    return PitchGate(chat, lens, True, "", TRIGGER_PROGRESS, MIN_PITCH_SEPARATION)
+
+
+def missing_calibration_gate() -> PitchGate:
+    return _invalid_gate(
+        "No C920 pitch calibration file. Automatic cutaways to C920 are off. "
+        "Run .\\run.ps1 -Calibrate with the switcher off. It screenshots the C920 source "
+        "only and does not change scenes. No scene change was made."
+    )
+
+
+def collect_pitch_samples(
+    measure,
+    sleep,
+    log,
+    label: str,
+    instructions: str,
+    *,
+    countdown=(3, 2, 1),
+    capture_s: float = 1.0,
+    period: float = 0.125,
+    min_frames: int = MIN_CALIBRATION_FRAMES,
+) -> list[float]:
+    """Countdown, then screenshot samples. `measure` returns a pitch or None.
+
+    The callable must not switch scenes. Sleep is injected so tests can record
+    the countdown without waiting.
+    """
+    log(f"Pose {label}. {instructions}")
+    log("Get into that pose. Countdown:")
+    for sec in countdown:
+        log(str(sec))
+        sleep(1.0)
+    log("Capturing now. Hold still.")
+    frames = max(int(min_frames), int(round(float(capture_s) / float(period))))
+    samples: list[float] = []
+    for _ in range(frames):
+        value = measure()
+        number = _finite(value)
+        if number is not None:
+            samples.append(number)
+        sleep(float(period))
+    log(f"{label}: {len(samples)} confident frames out of {frames}.")
+    return samples
+
+
+def detection_active(flag_on: bool, dry: bool) -> bool:
+    """The off flag skips live detection. Dry-run still scores and logs."""
+    return bool(dry) or bool(flag_on)
+
+
+def apply_runtime_mode(ctrl: "CutawayController", flag_on: bool, dry: bool) -> str:
+    ctrl.set_enabled(detection_active(flag_on, dry))
+    if dry and not flag_on:
+        return (
+            "switcher flag is OFF. Dry-run will still log detections and decisions. "
+            "No scene change will be made."
+        )
+    if dry:
+        return "Dry-run will log decisions and will not change scenes."
+    if flag_on:
+        return "switcher ON"
+    return "switcher OFF. Pending detections reset. No scene changes while off."
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    count = len(ordered)
+    mid = count // 2
+    if count % 2:
+        return float(ordered[mid])
+    return float(ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _invalid_gate(reason: str) -> PitchGate:
+    return PitchGate(0.0, 0.0, False, reason)
+
+
 class CutawayController:
     def __init__(
         self,
@@ -64,6 +291,11 @@ class CutawayController:
         self.expect_until = 0.0
         self.retry_after: float | None = None
         self.defer_decisions = False
+        self.pitch_gate: PitchGate | None = None
+        self.pitch_notice: str | None = None
+        self._pitch_block_logged: str | None = None
+        self.last_pitch: float | None = None
+        self.last_pitch_progress: float | None = None
 
     def set_enabled(self, on: bool) -> None:
         on = bool(on)
@@ -172,8 +404,19 @@ class CutawayController:
         self.last_external = external
         return self.logical_scene, note
 
-    def decide(self, brio_score: float, c920_score: float, now: float) -> Decision | None:
+    def decide(
+        self,
+        brio_score: float,
+        c920_score: float,
+        now: float,
+        c920_pitch=None,
+    ) -> Decision | None:
         self._sanitize()
+        self.last_pitch = _finite(c920_pitch)
+        self.last_pitch_progress = None
+        gate = self.pitch_gate
+        if gate is not None and gate.valid and self.last_pitch is not None:
+            self.last_pitch_progress = gate.progress(self.last_pitch)
         if not self.enabled or self.defer_decisions:
             self._clear_pending()
             return None
@@ -190,7 +433,7 @@ class CutawayController:
             return None
         if scene == self.c920_scene:
             return self._decide_return(brio, c920, now)
-        return self._decide_cutaway(brio, c920, now, scene)
+        return self._decide_cutaway(brio, c920, now, scene, c920_pitch)
 
     def commit(self, decision: Decision, now: float) -> bool:
         if decision.kind == "cutaway":
@@ -218,8 +461,15 @@ class CutawayController:
         self._sanitize()
         return True
 
-    def _decide_cutaway(self, brio: float, c920: float, now: float, scene: str) -> Decision | None:
+    def _decide_cutaway(
+        self, brio: float, c920: float, now: float, scene: str, pitch
+    ) -> Decision | None:
         if scene == self.c920_scene or not self._looking_at_c920(brio, c920):
+            if self.pending == "to_c920":
+                self._clear_pending()
+            return None
+        if not self._pitch_allows(pitch):
+            # Chat can look frontal on the C920. Do not let that time count as a look-up.
             if self.pending == "to_c920":
                 self._clear_pending()
             return None
@@ -244,6 +494,16 @@ class CutawayController:
         if not self._cooled(now):
             return None
         return Decision("return", dest, None)
+
+    def _pitch_allows(self, pitch) -> bool:
+        gate = self.pitch_gate
+        if gate is None or not gate.valid:
+            reason = gate.reason if gate is not None else missing_calibration_gate().reason
+            if reason != self._pitch_block_logged:
+                self._pitch_block_logged = reason
+                self.pitch_notice = reason
+            return False
+        return gate.allows(pitch)
 
     def _looking_at_c920(self, brio: float, c920: float) -> bool:
         if c920 < self.enter:
@@ -283,10 +543,10 @@ class CutawayController:
             self.cutaway_active = False
 
 
-def controller_from_config(cfg: dict) -> CutawayController:
+def controller_from_config(cfg: dict, pitch_gate: PitchGate | None = None) -> CutawayController:
     detect = cfg["detect"]
     cams = cfg["cameras"]
-    return CutawayController(
+    ctrl = CutawayController(
         c920_scene=str(cams["c920"]["scene"]),
         enter=float(detect["enter"]),
         stay=float(detect["stay"]),
@@ -296,6 +556,10 @@ def controller_from_config(cfg: dict) -> CutawayController:
         cooldown=float(detect["cooldown_s"]),
         ack_grace=float(cfg.get("ack_grace_s", 1.0)),
     )
+    ctrl.pitch_gate = pitch_gate
+    if pitch_gate is not None and not pitch_gate.valid:
+        ctrl._pitch_block_logged = pitch_gate.reason
+    return ctrl
 
 
 def validate_config(cfg: dict) -> list[str]:
@@ -307,8 +571,9 @@ def validate_config(cfg: dict) -> list[str]:
         return [
             "config.yaml is missing cameras.brio and cameras.c920. The v1 keys "
             "cameras.main and cameras.bit are not used. Set brio source to "
-            "'Video Capture Device', c920 source to 'Video Capture Device 2', and "
-            "c920 scene to 'C920' (see config.yaml.example). The OBS websocket "
+            "'Video Capture Device', c920 source to the live name (currently "
+            "'C920 Source'), and c920 scene to 'C920' (see config.yaml.example). "
+            "The OBS websocket "
             "password is not stored in this file. No scene change was made."
         ]
     errors: list[str] = []
@@ -362,8 +627,7 @@ def inventory_problems(
     if c920_source not in input_names:
         problems.append(
             f"OBS source '{c920_source}' (C920) was not found. The upper-right camera "
-            "source has to be named exactly like cameras.c920.source "
-            "(expected 'Video Capture Device 2'). No scene change was made."
+            f"source has to be named exactly '{c920_source}'. No scene change was made."
         )
     if c920_scene not in scene_names:
         problems.append(
@@ -475,7 +739,10 @@ def run_once(
         ctrl._clear_pending()
         logs.append("Pose scores were incomplete. No scene change was made.")
         return logs
-    decision = ctrl.decide(brio, c920, now)
+    decision = ctrl.decide(brio, c920, now, c920_pitch=scores.get("c920_pitch"))
+    if ctrl.pitch_notice:
+        logs.append(ctrl.pitch_notice)
+        ctrl.pitch_notice = None
     if decision is None:
         return logs
     try:
@@ -541,7 +808,10 @@ def run_once(
         return logs
     prefix = "DRY-RUN " if dry else "SWITCH "
     suffix = " (no OBS write)" if dry else ""
-    logs.append(prefix + plan.message + suffix)
+    extra = ""
+    if decision.kind == "cutaway" and ctrl.last_pitch_progress is not None:
+        extra = f" pitch_progress={ctrl.last_pitch_progress:.2f}"
+    logs.append(prefix + plan.message + extra + suffix)
     return logs
 
 

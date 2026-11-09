@@ -71,7 +71,7 @@ function Restore-Latest {
         Remove-Item $destTests -Recurse -Force
     }
     Write-Output "Restored $($latest.Name)."
-    Write-Output "Left in place: .venv, models, logs, switcher.on."
+    Write-Output "Left in place: .venv, models, logs, switcher.on, calibration.yaml."
     if (-not (Test-Path (Join-Path $latest.FullName "config.yaml"))) {
         Write-Output "config.yaml was not in that snapshot, so it was left as it is now."
     }
@@ -161,10 +161,11 @@ if ($replaceConfig) {
 }
 
 Write-Output "Updated code in $Target"
-Write-Output "Left untouched: .venv, models, logs, switcher.on"
+Write-Output "Left untouched: .venv, models, logs, switcher.on, config.yaml (unless -UpdateConfig), calibration.yaml"
 Write-Output "Backup: $snap"
 Write-Output "Rollback: powershell -NoProfile -ExecutionPolicy Bypass -File `"$hereFull\install-update.ps1`" -Rollback"
-Write-Output "Then from the install folder:"
+Write-Output "Then from the install folder, while the switcher flag is off:"
 Write-Output "  .\.venv\Scripts\python.exe -m unittest discover -s tests -v"
 Write-Output "  .\toggle.ps1 -Off"
-Write-Output "  .\run.ps1 -DryRun -Verbose -Seconds 20"
+Write-Output "  .\run.ps1 -Calibrate"
+Write-Output "  .\run.ps1 -DryRun -Verbose"

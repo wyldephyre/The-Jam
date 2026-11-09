@@ -12,6 +12,8 @@ sys.path.insert(0, str(ROOT))
 from cutaway import (  # noqa: E402
     CutawayController,
     Decision,
+    PitchGate,
+    apply_runtime_mode,
     controller_from_config,
     inventory_problems,
     run_once,
@@ -22,8 +24,12 @@ from cutaway import (  # noqa: E402
 SCENES = ["Starting Soon", "Chatting", "BRB", "Desktop", "Ending"]
 
 
+def lens_gate() -> PitchGate:
+    return PitchGate(0.0, 1.0, True, "")
+
+
 def make() -> CutawayController:
-    return CutawayController(
+    ctrl = CutawayController(
         c920_scene="C920",
         enter=0.45,
         stay=0.30,
@@ -33,10 +39,12 @@ def make() -> CutawayController:
         cooldown=1.5,
         ack_grace=1.0,
     )
+    ctrl.pitch_gate = lens_gate()
+    return ctrl
 
 
 def look_c920():
-    return {"brio": 0.05, "c920": 0.92}
+    return {"brio": 0.05, "c920": 0.92, "c920_pitch": 1.0}
 
 
 def look_brio():
@@ -343,17 +351,17 @@ class CutawayTests(unittest.TestCase):
         self.assertIsNone(ctrl.decide(0.8, 0.5, 1.0))
         self.assertIsNone(ctrl.decide(0.8, 0.5, 10.0))
         self.assertIsNone(ctrl.pending)
-        self.assertIsNone(ctrl.decide(0.2, 0.9, 11.0))
-        decision = ctrl.decide(0.2, 0.9, 11.5)
+        self.assertIsNone(ctrl.decide(0.2, 0.9, 11.0, c920_pitch=1.0))
+        decision = ctrl.decide(0.2, 0.9, 11.5, c920_pitch=1.0)
         self.assertIsNotNone(decision)
         self.assertEqual(decision.kind, "cutaway")
         self.assertEqual(decision.remember, "Desktop")
 
         ctrl = make()
         ctrl.observe_scene("Desktop")
-        self.assertIsNone(ctrl.decide(0.1, 0.9, 0.3))
+        self.assertIsNone(ctrl.decide(0.1, 0.9, 0.3, c920_pitch=1.0))
         # One 0.5s dwell later. 0.8 - 0.3 is a hair under 0.5 in binary floats.
-        decision = ctrl.decide(0.1, 0.9, 0.8)
+        decision = ctrl.decide(0.1, 0.9, 0.8, c920_pitch=1.0)
         self.assertIsNotNone(decision)
         self.assertEqual(decision.remember, "Desktop")
 
@@ -367,14 +375,14 @@ class CutawayTests(unittest.TestCase):
     def test_context_change_resets_direct_dwell(self):
         ctrl = make()
         ctrl.observe_scene("Desktop")
-        self.assertIsNone(ctrl.decide(0.1, 0.9, 1.0))
+        self.assertIsNone(ctrl.decide(0.1, 0.9, 1.0, c920_pitch=1.0))
         note = ctrl.observe_scene("BRB")
         self.assertIsNone(ctrl.pending)
         self.assertIn("Pending detections reset", note)
-        self.assertIsNone(ctrl.decide(0.1, 0.9, 1.4))
+        self.assertIsNone(ctrl.decide(0.1, 0.9, 1.4, c920_pitch=1.0))
         self.assertEqual(ctrl.pending_since, 1.4)
-        self.assertIsNone(ctrl.decide(0.1, 0.9, 1.7))
-        decision = ctrl.decide(0.1, 0.9, 1.9)
+        self.assertIsNone(ctrl.decide(0.1, 0.9, 1.7, c920_pitch=1.0))
+        decision = ctrl.decide(0.1, 0.9, 1.9, c920_pitch=1.0)
         self.assertEqual(decision.remember, "BRB")
 
     def test_no_scores_does_not_switch(self):
@@ -437,30 +445,57 @@ class CutawayTests(unittest.TestCase):
 
 
 class PackageTests(unittest.TestCase):
-    def test_config_names_and_no_secret(self):
-        text = (ROOT / "config.yaml").read_text(encoding="utf-8")
+    def test_example_documents_live_names_without_binding_custom_config(self):
         example = (ROOT / "config.yaml.example").read_text(encoding="utf-8")
-        self.assertEqual(text, example)
-        self.assertIn('source: "Video Capture Device"', text)
-        self.assertIn('source: "Video Capture Device 2"', text)
-        self.assertIn('scene: "C920"', text)
-        self.assertNotIn("REPLACE_ME", text)
-        self.assertNotIn("server_password", text)
-        self.assertNotIn("only_from_managed_scenes", text)
+        self.assertIn('source: "Video Capture Device"', example)
+        self.assertIn('source: "C920 Source"', example)
+        self.assertNotIn("Video Capture Device 2", example)
+        self.assertIn('scene: "C920"', example)
+        self.assertEqual(example.count("dwell_s: 0.25"), 2)
+        self.assertIn("cooldown_s: 0.6", example)
+        self.assertNotIn("REPLACE_ME", example)
+        self.assertNotIn("server_password", example)
+        self.assertNotIn("only_from_managed_scenes", example)
         for banned in (".mp3", ".wav", ".ogg"):
-            self.assertNotIn(banned, text)
+            self.assertNotIn(banned, example)
+        # A deployed config.yaml may differ from the template. That must still validate.
+        custom = {
+            "cameras": {
+                "brio": {"source": "Video Capture Device", "dwell_s": 0.25},
+                "c920": {"source": "C920 Source", "scene": "C920", "dwell_s": 0.25},
+            },
+            "detect": {
+                "enter": 0.45, "stay": 0.30, "margin": 0.15, "cooldown_s": 0.6,
+                "keypoint_conf": 0.5, "max_yaw": 0.6,
+            },
+            "status_every_s": 2,
+        }
+        self.assertEqual(validate_config(custom), [])
+        tuned = controller_from_config(custom, lens_gate())
+        self.assertEqual(tuned.dwell_to_c920, 0.25)
+        self.assertEqual(tuned.dwell_to_return, 0.25)
+        self.assertEqual(tuned.cooldown, 0.6)
+        other = {
+            "cameras": {
+                "brio": {"source": "Video Capture Device", "dwell_s": 0.4},
+                "c920": {"source": "C920 Source", "scene": "C920", "dwell_s": 0.33},
+            },
+            "detect": custom["detect"] | {"cooldown_s": 0.9},
+        }
+        self.assertEqual(validate_config(other), [])
+        self.assertNotEqual(other["cameras"]["c920"]["dwell_s"], 0.25)
 
     def test_launchers_keep_flags(self):
         run_ps1 = (ROOT / "run.ps1").read_text(encoding="utf-8")
         toggle = (ROOT / "toggle.ps1").read_text(encoding="utf-8")
-        for flag in ("--dry-run", "--bench", "--list-obs", "--verbose", "--duration", "gaze_switcher.py"):
+        for flag in ("--dry-run", "--calibrate", "--bench", "--list-obs", "--verbose", "--duration", "gaze_switcher.py"):
             self.assertIn(flag, run_ps1)
         self.assertIn(r".venv\Scripts\python.exe", run_ps1)
         self.assertIn("switcher.on", toggle)
 
     def test_installer_keeps_personal_files(self):
         script = (ROOT / "install-update.ps1").read_text(encoding="utf-8")
-        for kept in (".venv", "models", "logs", "switcher.on", "config.yaml"):
+        for kept in (".venv", "models", "logs", "switcher.on", "config.yaml", "calibration.yaml"):
             self.assertIn(kept, script)
         self.assertIn("-UpdateConfig", script)
         self.assertIn("-Rollback", script)

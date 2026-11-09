@@ -11,7 +11,8 @@ SetCurrentProgramScene.
 
 Usage:
   python gaze_switcher.py                 # live (switches scenes)
-  python gaze_switcher.py --dry-run       # log decisions only
+  python gaze_switcher.py --dry-run       # log decisions only; works while the flag is off
+  python gaze_switcher.py --calibrate     # record chat vs lens pitch; never switches scenes
   python gaze_switcher.py --bench         # Hailo model load + inference fps, no OBS
   python gaze_switcher.py --image x.jpg   # run pose on one image, print face keypoints
   python gaze_switcher.py --list-obs      # list OBS scenes + video capture inputs
@@ -34,8 +35,17 @@ import yaml
 from PIL import Image
 
 from cutaway import (
+    MIN_CALIBRATION_FRAMES,
+    MIN_PITCH_SEPARATION,
+    TRIGGER_PROGRESS,
+    apply_runtime_mode,
+    collect_pitch_samples,
     controller_from_config,
+    fit_pitch_gate,
     inventory_problems,
+    missing_calibration_gate,
+    pitch_gate_from_mapping,
+    pitch_proxy_from_person,
     run_once,
     screenshot_failure_message,
     validate_config,
@@ -287,12 +297,148 @@ def score_cameras(cl, model, cfg, brio_source: str, c920_source: str):
     scores, notes = {}, {}
     for key, source in (("brio", brio_source), ("c920", c920_source)):
         img = grab(cl, source, cap["width"], cap["height"], cap["quality"])
-        score, why = frontal_score(
-            main_person(model(img)), detect["keypoint_conf"], detect["max_yaw"]
-        )
+        person = main_person(model(img))
+        score, why = frontal_score(person, detect["keypoint_conf"], detect["max_yaw"])
         scores[key] = score
         notes[key] = why
+        if key == "c920":
+            scores["c920_pitch"] = pitch_proxy_from_person(person, detect["keypoint_conf"])
     return scores, notes
+
+
+def calibration_path(cfg) -> Path:
+    return ROOT / str(cfg.get("calibration", "calibration.yaml"))
+
+
+def load_pitch_gate(cfg):
+    path = calibration_path(cfg)
+    if not path.exists():
+        return missing_calibration_gate()
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        gate = missing_calibration_gate()
+        gate.reason = (
+            f"Could not read {path.name} ({type(exc).__name__}). Automatic cutaways stay off. "
+            "Run .\\run.ps1 -Calibrate. No scene change was made."
+        )
+        return gate
+    return pitch_gate_from_mapping(data)
+
+
+def save_pitch_gate(path: Path, gate, chat_frames: int, lens_frames: int) -> None:
+    if not gate.valid:
+        raise RuntimeError("refusing to write an invalid pitch calibration")
+    document = {
+        "version": 1,
+        "feature": "eye_line_pitch_proxy",
+        "chat_pitch": round(float(gate.chat_pitch), 4),
+        "lens_pitch": round(float(gate.lens_pitch), 4),
+        "chat_frames": int(chat_frames),
+        "lens_frames": int(lens_frames),
+        "trigger_progress": TRIGGER_PROGRESS,
+        "min_separation": MIN_PITCH_SEPARATION,
+        "note": (
+            "Nose offset perpendicular to the eye line, in eye-distance units. "
+            "Not world pitch and not eye gaze. Redo if the C920 moves."
+        ),
+    }
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+
+def calibrate(cfg) -> int:
+    """Record chat vs lens pitch from C920 screenshots. Never changes the program scene."""
+    errors = validate_config(cfg)
+    if errors:
+        for err in errors:
+            log.error("%s", err)
+        return 2
+    log.info(
+        "Calibration only. Screenshotting the C920 source. "
+        "No scene, mute, audio, recording, or streaming change will be made."
+    )
+    try:
+        model = PoseModel(ROOT / cfg["model"]["hef"], cfg["model"]["conf"])
+    except Exception as exc:
+        log.error(
+            "Could not load the Hailo pose model (%s). No scene change was made.",
+            type(exc).__name__,
+        )
+        return 2
+    adapter = None
+    try:
+        try:
+            adapter = connect_obs(cfg)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            log.error(
+                "OBS not reachable (%s). Start OBS and enable the WebSocket server. "
+                "No scene change was made.",
+                type(exc).__name__,
+            )
+            return 2
+        source = str(cfg["cameras"]["c920"]["source"])
+        scenes = adapter.get_scene_names()
+        inputs = adapter.get_input_names()
+        for problem in inventory_problems(
+            inputs, scenes, str(cfg["cameras"]["brio"]["source"]), source, str(cfg["cameras"]["c920"]["scene"])
+        ):
+            if source in problem or cfg["cameras"]["c920"]["scene"] in problem:
+                log.error("%s", problem)
+                return 2
+        cap = cfg["capture"]
+        period = 1.0 / float(cap["fps"])
+        min_conf = float(cfg["detect"]["keypoint_conf"])
+
+        def measure():
+            image = grab(adapter.client, source, cap["width"], cap["height"], cap["quality"])
+            return pitch_proxy_from_person(main_person(model(image)), min_conf)
+
+        def say(message: str) -> None:
+            log.info("%s", message)
+
+        chat_samples = collect_pitch_samples(
+            measure, time.sleep, say, "1 of 2 CHAT",
+            "Turn your head the way you do when reading chat on the right monitor. "
+            "Do not look up into the C920.",
+            period=period,
+            min_frames=MIN_CALIBRATION_FRAMES,
+        )
+        lens_samples = collect_pitch_samples(
+            measure, time.sleep, say, "2 of 2 LENS",
+            "Look up into the C920 lens and hold still.",
+            period=period,
+            min_frames=MIN_CALIBRATION_FRAMES,
+        )
+    except GrabError as exc:
+        log.error("%s", exc)
+        return 2
+    finally:
+        model.close()
+    gate = fit_pitch_gate(chat_samples, lens_samples)
+    if not gate.valid:
+        log.error("%s", gate.reason)
+        return 2
+    path = calibration_path(cfg)
+    save_pitch_gate(path, gate, len(chat_samples), len(lens_samples))
+    log.info(
+        "Saved %s. Chat pitch_proxy %.2f (%d frames). Lens pitch_proxy %.2f (%d frames). "
+        "A cutaway needs the live value at least %.0f%% of the way from chat to lens "
+        "(separation %.2f, minimum %.2f).",
+        path.name,
+        gate.chat_pitch, len(chat_samples),
+        gate.lens_pitch, len(lens_samples),
+        TRIGGER_PROGRESS * 100,
+        abs(gate.lens_pitch - gate.chat_pitch),
+        MIN_PITCH_SEPARATION,
+    )
+    log.info(
+        "This is not eye tracking. The Hailo model is unchanged. "
+        "Move the C920 and this file is wrong until you calibrate again. "
+        "Next, with the switcher still off: .\\run.ps1 -DryRun -Verbose"
+    )
+    return 0
 
 
 def list_obs(cfg):
@@ -406,7 +552,8 @@ def run(cfg, dry: bool, duration: float | None) -> int:
     cams = cfg["cameras"]
     brio_source = str(cams["brio"]["source"])
     c920_source = str(cams["c920"]["source"])
-    ctrl = controller_from_config(cfg)
+    pitch_gate = load_pitch_gate(cfg)
+    ctrl = controller_from_config(cfg, pitch_gate)
     try:
         model = PoseModel(ROOT / cfg["model"]["hef"], cfg["model"]["conf"])
     except Exception as exc:
@@ -423,9 +570,17 @@ def run(cfg, dry: bool, duration: float | None) -> int:
     )
     log.info(
         "BRIO source '%s'; C920 source '%s'; cutaway scene '%s'. "
-        "Look at the C920 to cut away from any scene; look at the BRIO to return.",
+        "Look up into the C920 to cut away from any scene; look at the BRIO to return.",
         brio_source, c920_source, ctrl.c920_scene,
     )
+    if pitch_gate.valid:
+        log.info(
+            "Pitch gate on: chat %.2f, lens %.2f, trigger progress %.2f. "
+            "Frontal score alone does not cut to C920.",
+            pitch_gate.chat_pitch, pitch_gate.lens_pitch, pitch_gate.trigger_progress,
+        )
+    else:
+        log.warning("%s", pitch_gate.reason)
     period = 1.0 / float(cfg["capture"]["fps"])
     start = time.monotonic()
     adapter = None
@@ -436,13 +591,10 @@ def run(cfg, dry: bool, duration: float | None) -> int:
     try:
         while duration is None or time.monotonic() - start < duration:
             on = flag_on(cfg)
-            if on != was_on:
-                ctrl.set_enabled(on)
-                log.info("switcher %s (flag file %s)", "ON" if on else "OFF", flag_name)
-                if not on:
-                    log.info("Pending detections reset. No scene changes while off.")
+            if was_on is None or on != was_on:
+                log.info("%s (flag file %s)", apply_runtime_mode(ctrl, on, dry), flag_name)
                 was_on = on
-            if not on:
+            if not ctrl.enabled:
                 time.sleep(0.5)
                 continue
             if adapter is None:
@@ -534,9 +686,14 @@ def run(cfg, dry: bool, duration: float | None) -> int:
             for line in lines:
                 _log_decision(line)
             if notes and (cfg.get("verbose") or now - last_status > float(cfg.get("status_every_s", 5))):
+                pitch = scores.get("c920_pitch")
+                progress = ctrl.last_pitch_progress
                 log.info(
-                    "scores brio=%.2f (%s)  c920=%.2f (%s)  scene=%s  remembered=%s",
+                    "scores brio=%.2f (%s)  c920=%.2f (%s)  c920_pitch=%s  progress=%s  "
+                    "scene=%s  remembered=%s",
                     scores["brio"], notes["brio"], scores["c920"], notes["c920"],
+                    "none" if pitch is None else f"{pitch:.2f}",
+                    "none" if progress is None else f"{progress:.2f}",
                     ctrl.logical_scene, ctrl.return_scene,
                 )
                 last_status = now
@@ -553,6 +710,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=str(ROOT / "config.yaml"))
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="record chat vs C920-lens pitch; never switches scenes")
     ap.add_argument("--duration", type=float, default=None, help="stop after N seconds")
     ap.add_argument("--bench", action="store_true")
     ap.add_argument("--image")
@@ -576,6 +735,8 @@ def main(argv: list[str] | None = None) -> int:
     dry = bool(args.dry_run or cfg.get("dry_run", False))
     setup_logging(cfg, dry)
     try:
+        if args.calibrate:
+            return calibrate(cfg)
         if args.bench:
             bench(cfg)
             return 0

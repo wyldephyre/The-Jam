@@ -1,109 +1,120 @@
 # Jam Production Assistant
 
-Look up at the upper-right Logitech C920 and hold it for about half a second. OBS cuts to the scene named exactly `C920`, from whatever is on program: Starting Soon, Chatting, BRB, Desktop, Ending, or anything else. Look back at the Logitech BRIO and OBS returns to the scene you were on. It does not always return to Chatting.
+Look up into the upper-right Logitech C920 and hold it. OBS cuts to the scene named exactly `C920`, from whatever is on program: Starting Soon, Chatting, BRB, Desktop, Ending, or anything else. Look back at the Logitech BRIO and OBS returns to the scene that was actually on program. A manual scene change during the cutaway clears that memory.
 
-Pose detection runs on the ASUS UGen300 (Hailo-10H). Frames come from OBS source screenshots (`GetSourceScreenshot`), so this program never opens the webcams. The only OBS change it can make is `SetCurrentProgramScene`. It does not create scenes, edit sources, change mute or audio routing, or start and stop recording or streaming.
+Turning your head right to read chat is not a look into the lens. The face score used for "which camera is in front of me" is horizontal only (nose centered between the eyes). After the C920 was moved high and to the right, that score treats chat-reading as a C920 look. A second measurement, calibrated on your two poses, has to agree before a cutaway.
 
-There is no sound file in this package. A sting, if you want one, is an OBS Media Source you add on the C920 scene yourself. A per-scene transition is also set in OBS (scene transition override), not by this script.
+Frames come from OBS source screenshots (`GetSourceScreenshot`). This program does not open the webcams. The only OBS write it can make is `SetCurrentProgramScene`. It does not create scenes, edit sources, change mute or audio routing, or start and stop recording or streaming. The Hailo model file is unchanged.
 
-The assistant was not part of the The-Jam website. It lives here so the site stays as it is. On the streaming PC the install path is `D:\TheForge\Dev\jam-production-assistant`.
+There is no sound file in this package. A sting or a per-scene transition is something you add in OBS.
 
-## OBS names
+The website in the rest of The-Jam is not part of this tool. On the streaming PC the install path is `D:\TheForge\Dev\jam-production-assistant`.
 
-These strings have to match OBS character for character.
+## What the pitch gate is, and what it is not
+
+The gate is the nose's position perpendicular to the line between the eyes, in units of eye distance, after in-plane head roll is removed. A sideways nose shift does not move it. Low confidence on the nose or either eye makes the value unavailable, and an unavailable value does not cut.
+
+It is not eye tracking, not a 3D head angle, and not a universal "nose above the eyes means looking up." Camera placement decides which direction of that number means "into this lens." Calibration records your chat-reading pose and your look into the C920, then requires the live value to be at least 65% of the way from the chat sample to the lens sample. The two samples must differ by at least 0.15 eye-distances or the file is rejected.
+
+If `calibration.yaml` is missing or invalid, automatic cutaways stay off. Returns from a C920 you switched to yourself still use the BRIO face score. Moving the camera makes the file wrong until you calibrate again.
+
+These checks use synthetic keypoints. They do not show that your face on the Forge cameras separates chat from a look-up. That is only known after the calibration and dry-run below.
+
+## OBS names in the current template
 
 | Role | OBS name |
 |---|---|
 | BRIO source | `Video Capture Device` |
-| C920 source | `Video Capture Device 2` |
+| C920 source | `C920 Source` |
 | Cutaway scene | `C920` |
 
-In both Video Capture Device sources, open Properties and uncheck **Deactivate when not showing**. The C920 source can live only on the C920 scene, and the BRIO source can live on the other scenes. Screenshots still have to work while that source is off program, which they will not do if OBS deactivates it.
-
-`.\run.ps1 -ListObs` prints the scene list and the video-capture source names.
-
-## One-time OBS setup
-
-1. Tools > WebSocket Server Settings > enable the server, leave authentication on, Apply. The script reads the port and password from OBS's own websocket config when it runs. They are not stored in `config.yaml` and are not written to the log.
-2. Confirm the two source names and the `C920` scene above.
-3. Uncheck **Deactivate when not showing** on both sources.
-4. Optional: set a transition override on the C920 scene, and add your own Media Source if you want a sting.
+The running install keeps whatever is already in its own `config.yaml`. The template uses dwell 0.25 s on both cameras and cooldown 0.6 s. Both capture sources need **Deactivate when not showing** unchecked so a screenshot still works when that source is off program.
 
 ## Update the existing D: folder
 
-Extract this update somewhere other than the install folder (Downloads is fine). Then:
+Stop the running assistant with Ctrl+C first so the old process is not still switching. Extract the zip somewhere other than the install folder. Do not pass `-UpdateConfig` on Forge. Your `config.yaml` stays as it is, including source names and the 0.25 / 0.25 / 0.6 timings. `calibration.yaml`, `.venv`, `models\`, `logs\`, and `switcher.on` are not replaced. Code files are backed up under `rollback\<timestamp>\` first.
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install-update.ps1 -UpdateConfig
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-update.ps1
 ```
 
-`-UpdateConfig` is the right switch for the Oct 31 snapshot, whose `config.yaml` still has `REPLACE_ME` placeholders and the old `main` / `bit` keys. The script copies that file into `rollback\<timestamp>\` and then writes the C920 names. There is no websocket password in the file. `.venv`, `models\` (including `yolov8s_pose.hef`), `logs\`, and `switcher.on` are not replaced.
-
-Leave `-UpdateConfig` off only when `config.yaml` already has `cameras.brio` and `cameras.c920` and you want to keep your dwell numbers. The new template is still written to `config.yaml.example`.
-
-Roll back the code (and the config, if that snapshot replaced it):
+Rollback, from that same extracted folder:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install-update.ps1 -Rollback
 ```
 
-Run the rollback command from the extracted update folder. It restores the newest `rollback\<timestamp>\` and does not delete `.venv`, `models`, or `logs`.
+`-UpdateConfig` replaces `config.yaml` with the template. Use it only for a leftover v1 file that still contains `REPLACE_ME`. It is the wrong switch once Forge already has a working config.
 
-## Run
+## Calibrate while you are on stream
 
-From `D:\TheForge\Dev\jam-production-assistant`:
+The switcher must not be cutting scenes during this. Calibration never calls a scene change, and it does not need `switcher.on`. Each pose is a countdown of 3, 2, 1 (one second apart) and then a one-second capture. Watch the console. Hold the pose through "Capturing now."
+
+```powershell
+cd D:\TheForge\Dev\jam-production-assistant
+.\toggle.ps1 -Off
+.\run.ps1 -Calibrate
+```
+
+1. **CHAT.** When it says `Pose 1 of 2 CHAT`, turn your head the way you do to read chat on the right monitor. Do not look up into the C920. The countdown starts immediately: 3, 2, 1, then one second of capture.
+2. **LENS.** When it says `Pose 2 of 2 LENS`, look up into the C920 lens and hold. Same countdown, then one second.
+3. If the log says the poses are too similar or a pose had fewer than 5 confident frames, `calibration.yaml` is not written and cutaways stay off. Run `-Calibrate` again with a clearer difference between the two poses.
+4. If it saves the file, it prints both pitch numbers. Leave the flag off and dry-run.
+
+## Dry-run while the flag is off
+
+`-Off` used to skip the loop, so this sequence logged nothing. Dry-run now scores and logs with the flag absent, and it still does not change the program scene.
 
 ```powershell
 .\toggle.ps1 -Off
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\run.ps1 -DryRun -Verbose
+```
+
+Read chat the way you normally do. You should see scores and `c920_pitch` / `progress`, and you should not see `DRY-RUN cutaway`. `progress` for chat should stay under 0.65.
+
+Look up into the C920 and hold past 0.25 s. The log should show one `DRY-RUN cutaway '<scene you are on>' -> 'C920'` with `pitch_progress` at or above 0.65.
+
+Look back at the BRIO and hold past 0.25 s (and past the 0.6 s cooldown). The log should show `DRY-RUN return 'C920' -> '<that same scene>'`.
+
+Stop the dry-run with Ctrl+C. Only if those three checks match what you see:
+
+```powershell
 .\toggle.ps1 -On
-.\run.ps1 -DryRun -Verbose -Seconds 20
 .\run.ps1
 ```
 
-`toggle.ps1` still creates or removes `switcher.on`. While that file is absent the loop stays idle and does not change scenes. `-DryRun` logs `DRY-RUN cutaway` / `DRY-RUN return` and does not call OBS to switch. Stream Deck actions that already launch `toggle.ps1` or `run.ps1` keep the same parameters (`-DryRun`, `-Verbose`, `-Seconds`, `-Bench`, `-ListObs`, `-On`, `-Off`).
+`toggle.ps1` still creates or removes `switcher.on`. With the flag absent and without `-DryRun` or `-Calibrate`, the process idles and does not grab frames. Stream Deck actions that launch `toggle.ps1` or `run.ps1` keep the same parameters, plus `-Calibrate`.
 
 Logs: `logs\switcher.log` and `logs\dry-run.log`.
 
-If a source or the C920 scene is missing, or OBS disconnects, the log says what to fix and the program scene is left alone. A manual scene change while the cutaway is up clears the remembered scene, so looking at the BRIO afterward cannot jump back to a stale scene. The next look-up remembers the scene you are on then. If the assistant starts while OBS is already on `C920`, it will not guess a return scene.
+A manual scene change while the cutaway is up clears the remembered scene. The next look-up remembers the scene you are on then. If the assistant starts while OBS is already on `C920`, it will not guess a return scene.
 
 ## Tuning
 
-`config.yaml` → `detect` and the per-camera `dwell_s` values:
+`config.yaml` is yours. This update does not rewrite it.
 
 | Knob | Effect |
 |---|---|
-| `cameras.c920.dwell_s` | How long the C920 must see the more frontal face before the cut (default 0.5 s) |
-| `cameras.brio.dwell_s` | How long the BRIO must win before returning (default 0.4 s) |
-| `enter` | Frontal score required before a look can win |
-| `stay` / `margin` | The current camera keeps the shot unless the other one drops it under `stay` or beats it by `margin` |
-| `cooldown_s` | Minimum time between cuts |
-| `max_yaw` | How far the nose can sit off the eye midpoint and still count as facing that camera |
-| `keypoint_conf` | Confidence required for the nose and both eyes |
+| `cameras.c920.dwell_s` | How long the lens pose must hold before the cut (live setting 0.25 s) |
+| `cameras.brio.dwell_s` | How long the BRIO must win before returning (live setting 0.25 s) |
+| `cooldown_s` | Minimum time between cuts (live setting 0.6 s) |
+| `enter` / `stay` / `margin` | Frontal-score hysteresis. The pitch gate is applied on top of this for cutaways only |
+| `keypoint_conf` | Confidence required for the nose and both eyes. Below this, pitch is missing and there is no cutaway |
 
-The score is the same v1 face score: a centered nose between the eyes (and the ears, when both are visible). Whichever camera sees the more frontal face wins. Looking up-right at the C920 is that camera winning, held for the dwell. No person, or neither camera clearly ahead, means no cut. `-DryRun -Verbose` prints `yaw=` so you can tune.
+The 0.65 progress bar and the 0.15 separation floor are in the program, not in `config.yaml`. A `trigger_progress` value written into `calibration.yaml` is ignored so the bar cannot be edited down into the chat pose.
 
 ## Tests
 
-Mock tests do not open OBS, the webcams, or the Hailo:
+Mock tests do not open OBS, the webcams, or the Hailo. A customized `config.yaml` does not have to match `config.yaml.example`.
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-They cover a cut from Starting Soon, Chatting, BRB, Desktop, and Ending; return to that same scene; no nested C920 memory; a manual scene change during the cutaway; the off flag; and a dropped websocket. `python -m unittest` from a checkout of this folder is the same suite.
+They cover cutaway from Starting Soon, Chatting, BRB, Desktop, and Ending; return to that scene; no nested C920; manual scene changes; the off flag; dry-run with the flag off; disconnect; a chat-like frontal score versus a calibrated lens pose; a camera whose lens sample is the opposite sign from "nose above eyes"; low confidence; missing and invalid calibration; and the 3-2-1 countdown.
 
-## Not run on the streaming PC
+## Not verified on the streaming PC
 
-This change was not pointed at the live OBS or the UGen300. After you install it, still check:
+No run here watched you read chat or look into the C920. The earlier dry-run (9 cutaways and 9 returns, no warnings) was before this gate and was matching the horizontal score, including chat. After you install this build, the calibration and the dry-run above are the check. Do not treat cutaways as fixed until that dry-run stays quiet while you read chat and fires once when you look into the lens.
 
-- `.\run.ps1 -ListObs` shows scene `C920` and sources `Video Capture Device` and `Video Capture Device 2`.
-- Both sources have **Deactivate when not showing** unchecked, and a source screenshot still works while that source is off program.
-- `.\run.ps1 -DryRun -Verbose`: look up, confirm `DRY-RUN cutaway '<the scene you were on>' -> 'C920'`; look back, confirm `DRY-RUN return 'C920' -> '<that same scene>'`.
-- Live, once: from Starting Soon or BRB, look up and back. Then while the C920 scene is up, click another scene yourself and look at the BRIO. The program scene should stay where you put it.
-- Mute, desktop audio, recording, and the stream do not change across a cut.
-- Optional Hailo check: `.\run.ps1 -Bench`.
-
-## Out of scope
-
-Gestures, away/BRB detection, captions, chat, and clip markers are not in this switcher. The website in the rest of The-Jam is not part of this tool.
+Also confirm mute, desktop audio, recording, and the stream do not change across a later live cut. Optional: `.\run.ps1 -Bench` for the Hailo.
