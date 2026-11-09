@@ -1,0 +1,7 @@
+.venv/
+logs/
+models/*.hef
+switcher.on
+__pycache__/
+rollback/
+*.pyc

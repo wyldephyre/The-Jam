@@ -1,0 +1,6 @@
+numpy>=1.24
+Pillow>=10
+PyYAML>=6
+obsws-python>=1.6
+# Hailo SDK (hailo_platform) is installed in the streaming PC .venv separately.
+# It is not required to run the mock tests.
