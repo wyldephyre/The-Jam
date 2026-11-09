@@ -1,147 +1,65 @@
 # WyldePhyre Viewer Hub
 
-A centralized, multi-platform interaction site for live streams (Twitch/Rumble/X). Viewers access via one shared link posted in chats to request Spotify songs, send messages, and earn loyalty time.
+One link for a live stream. Viewers enter a shared password, request Spotify songs, send messages, and earn loyalty time. The host approves requests and can show the consolidated Twitch, YouTube, Rumble, and X chat captured by [Social Stream Ninja](https://github.com/steveseguin/social_stream).
 
-## Features
+## Stack
 
-- **Password-gated access** for viewers and separate admin dashboard
-- **Viewer loyalty tracking** via active time on site (Page Visibility API)
-- **Auto-promote to "Regular"** after configurable threshold (default: 300 hours)
-- **Spotify song requests** with search and queue integration
-- **Moderated messages** with approval workflow
-- **Real-time feed** of approved requests via Supabase Realtime
-- **OBS overlay output** for displaying current song requests on stream
+- **App:** [Hono](https://hono.dev) on [Bun](https://bun.sh). Pages are server-rendered HTML with a small inline script.
+- **Data:** SQLite (`the-jam.db`) through `bun:sqlite`
+- **Live updates:** Server-Sent Events (`GET /api/events` for requests, `GET /api/chat/stream` for chat)
+- **Host:** a Zo Computer HTTP service. See [docs/DEPLOY-ZO.md](docs/DEPLOY-ZO.md).
 
-## Tech Stack
+The old React/Vite/Express/Supabase layout is gone. `supabase/schema.sql` is kept as a reference only.
 
-- **Frontend:** React + Vite
-- **Backend:** Node.js + Express (Vercel deployable)
-- **Database:** Supabase (PostgreSQL + Realtime)
-- **Spotify:** spotify-web-api-node
-
-## Setup
-
-### 1. Supabase Setup
-
-1. Create a new project at [supabase.com](https://supabase.com)
-2. Go to SQL Editor and run the contents of `supabase/schema.sql`
-3. Get your project URL, anon key, and service key from Settings > API
-
-### 2. Spotify Setup
-
-1. Go to [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)
-2. Create a new app
-3. Add `http://localhost:3001/callback` to Redirect URIs
-4. Note your Client ID and Client Secret
-5. Get a refresh token:
-   - Use the [Spotify Authorization Flow](https://developer.spotify.com/documentation/web-api/tutorials/code-flow) with scopes: `user-modify-playback-state user-read-playback-state`
-   - Or use a tool like [spotify-token-swap](https://github.com/bih/spotify-token-swap)
-
-### 3. Environment Variables
-
-**Backend:** Copy `.env.example` to `backend/.env` and fill in values:
+## Run locally
 
 ```bash
-cd backend
-cp ../.env.example .env
-# Edit .env with your values
-```
-
-**Frontend:** Copy `frontend/.env.example` to `frontend/.env`:
-
-```bash
-cd frontend
+bun install
 cp .env.example .env
-# Edit .env with your Supabase URL and anon key
+# set VIEWER_PASSWORD and ADMIN_PASSWORD at minimum
+bun run dev
 ```
 
-### 4. Install Dependencies
+Open `http://localhost:3000`. The process refuses to start if either password is empty.
 
 ```bash
-# Backend
-cd backend
-npm install
-
-# Frontend
-cd ../frontend
-npm install
+bun test
+bash scripts/smoke.sh
 ```
 
-### 5. Run Development
+## Pages
 
-```bash
-# Terminal 1 - Backend
-cd backend
-npm run dev
+| URL | Who |
+| --- | --- |
+| `/` | Viewer password gate. `/?admin=true` is the admin gate. |
+| `/hub` | Song requests, messages, loyalty time, approved feed, live chat. |
+| `/admin` | Approve or reject requests, regulars, clear the OBS line, live chat. |
 
-# Terminal 2 - Frontend
-cd frontend
-npm run dev
-```
+API calls send `x-viewer-password` or `x-admin-password`. Those values stay in `sessionStorage` in the browser. The Social Stream session id and password stay in server environment variables and are never written into the page.
 
-Visit `http://localhost:5173` for the viewer hub.
+`GET /api/overlay/current` is plain text for an OBS browser source. It is not password protected, same as before.
 
-## Usage
+## Live chat
 
-### Viewer Flow
+Social Stream Ninja is GPL-3.0 and is not copied into this repo. The Bun process joins SSN's hosted websocket as a listener and stores a short plain-text history. The hub renders that text with the same HTML escaping used for song requests.
 
-1. Share the link in your stream chats
-2. Viewers enter the password to access
-3. Optional: Set a display name
-4. Search and request songs or send messages
-5. Regulars (300+ hours) get auto-approved song requests
+Setup for the streaming PC and for Niner is in [docs/DEPLOY-ZO.md](docs/DEPLOY-ZO.md). Chat is off until `SSN_SESSION_ID` is set.
 
-### Admin Dashboard
+## Environment
 
-1. Visit `/?admin=true` or click "Admin Login" on gate
-2. Enter admin password
-3. Approve/reject pending requests
-4. Manage viewers (promote/demote regulars)
-5. Clear OBS overlay when needed
-
-### OBS Overlay Setup
-
-**Option 1: Text File (Local)**
-1. Add a "Text (GDI+)" source in OBS
-2. Check "Read from file"
-3. Browse to `backend/overlay/now-playing.txt`
-
-**Option 2: Browser Source (Remote)**
-1. Add a "Browser" source in OBS
-2. Set URL to `http://your-server/api/overlay/current`
-3. Refresh periodically or use custom CSS for styling
-
-## Deployment (Vercel)
-
-### Backend
-
-```bash
-cd backend
-vercel
-```
-
-Set environment variables in Vercel dashboard.
-
-### Frontend
-
-```bash
-cd frontend
-npm run build
-vercel
-```
-
-Update the API proxy in production or set `VITE_API_URL` environment variable.
-
-## Configuration
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `VIEWER_PASSWORD` | Password for viewer access | Required |
-| `ADMIN_PASSWORD` | Password for admin dashboard | Required |
-| `REGULAR_THRESHOLD_MINUTES` | Minutes to become a Regular | 18000 (300 hours) |
-| `OVERLAY_FILE_PATH` | Path to OBS overlay text file | `./overlay/now-playing.txt` |
+| Variable | Purpose |
+| --- | --- |
+| `VIEWER_PASSWORD` | Required. Viewer gate. |
+| `ADMIN_PASSWORD` | Required. Admin gate. |
+| `REGULAR_THRESHOLD_MINUTES` | Minutes until auto-regular. Default 18000 (300 hours). |
+| `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` / `SPOTIFY_REFRESH_TOKEN` | Song search and queue. |
+| `PORT` | Listen port. Default 3000. Zo sets this for a service. |
+| `SSN_SESSION_ID` | Secret SSN session id. Empty disables chat. |
+| `SSN_PASSWORD` | Secret SSN session password, if one is set. |
+| `SSN_SERVER_URL` | Default `wss://io.socialstream.ninja`. |
+| `SSN_PLATFORMS` | Default `twitch,youtube,rumble,x,twitter`. `*` allows every source. |
+| `SSN_HIDE_BOTS` | `1` drops messages SSN marks as bots. |
 
 ## License
 
-MIT
-
+MIT. Social Stream Ninja itself is GPL-3.0 and is used as a separate program.

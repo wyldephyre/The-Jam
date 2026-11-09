@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "scripts": {
     "dev": "bun run --hot index.tsx",
-    "start": "bun run index.tsx"
+    "start": "bun run index.tsx",
+    "test": "bun test",
+    "smoke": "bash scripts/smoke.sh"
   },
   "dependencies": {
     "hono": "^4.6.0"
