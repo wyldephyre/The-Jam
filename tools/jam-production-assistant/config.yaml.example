@@ -39,5 +39,14 @@ dry_run: false
 status_every_s: 5
 log_dir: logs
 ack_grace_s: 1.0                 # wait this long for OBS to confirm a cut before trusting a mismatch
+
+# Optional. Missing keys use these defaults. Dim or red frames are stretched before pose inference.
+preprocess:
+  mode: auto
+  low_light_mean: 50
+
+# Optional. Lens must sit this many within-pose standard deviations from both other poses.
+calibrate:
+  separation_k: 2.0
 # calibration.yaml is created by -Calibrate and is not stored here.
 # Missing or invalid calibration disables automatic cutaways. It does not change scenes.

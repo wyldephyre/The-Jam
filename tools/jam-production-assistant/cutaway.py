@@ -44,6 +44,14 @@ CAL_HOLD_S = 3.0
 CAL_SETTLE_S = 1.5
 CAL_EDGE_TRIM_S = 0.5
 CAL_CYCLES = 2
+FEATURE_NAMES = ("brio_pitch", "brio_yaw", "c920_frontal", "c920_pitch", "c920_yaw")
+SEPARATION_K = 2.0
+SAY_OVERLAP_CHAT = (
+    "Chat and camera looked the same. Try tipping your chin up more for the camera."
+)
+SAY_OVERLAP_FRONT = (
+    "Straight ahead and the camera looked the same. Tip your chin up more for the camera."
+)
 
 SAY_VOICE_CHECK = (
     "Voice check. If you can hear this, we can start. "
@@ -85,6 +93,15 @@ class PitchGate:
     chat_yaw: float | None = None
     lens_yaw: float | None = None
     axis_note: str = ""
+    kept: tuple = ()
+    scales: dict | None = None
+    means: dict | None = None
+    stds: dict | None = None
+    sep_front: float = 0.0
+    sep_chat: float = 0.0
+    report: str = ""
+    spoken: str = ""
+    separation_k: float = 2.0
 
     @property
     def uses_yaw(self) -> bool:
@@ -143,6 +160,46 @@ class PitchGate:
 
     def _sep_chat(self) -> float:
         return _hypot(self._lens_point(), self._chat_point())
+
+    def pose_progress(self, values) -> float | None:
+        if not self.valid or not self.kept:
+            return None
+        live = self._z(values)
+        if live is None:
+            return None
+        span = min(self.sep_front, self.sep_chat)
+        if span < 1e-9:
+            return None
+        return 1.0 - _euclid(live, self._z_mean("lens")) / span
+
+    def allows_pose(self, values) -> bool:
+        if not self.valid or not self.kept:
+            return False
+        live = self._z(values)
+        if live is None:
+            return False
+        d_lens = _euclid(live, self._z_mean("lens"))
+        d_front = _euclid(live, self._z_mean("front"))
+        d_chat = _euclid(live, self._z_mean("chat"))
+        if not (d_lens < d_front and d_lens < d_chat):
+            return False
+        limit = (1.0 - TRIGGER_PROGRESS) * min(self.sep_front, self.sep_chat)
+        return d_lens <= limit + 1e-9
+
+    def _z(self, values):
+        if not isinstance(values, dict):
+            return None
+        point = []
+        for name in self.kept:
+            number = _finite(values.get(name))
+            scale = _finite((self.scales or {}).get(name))
+            if number is None or scale is None or scale < 1e-9:
+                return None
+            point.append(number / scale)
+        return point
+
+    def _z_mean(self, pose: str):
+        return [self.means[pose][name] / self.scales[name] for name in self.kept]
 
 
 def pitch_proxy(nose, left_eye, right_eye) -> float | None:
@@ -338,6 +395,8 @@ def fit_pose_gate(
 
 
 def pitch_gate_from_mapping(data) -> PitchGate:
+    if isinstance(data, dict) and data.get("version") == 3:
+        return multicam_gate_from_mapping(data)
     if not isinstance(data, dict) or data.get("version") != 2:
         return _invalid_gate(
             "calibration.yaml is missing or is not version 2 with straight-ahead, chat, and lens. "
@@ -373,6 +432,237 @@ def pitch_gate_from_mapping(data) -> PitchGate:
         "both straight-ahead and chat. trigger_progress in the file is ignored."
     )
     return gate
+
+
+def _variance(values: list[float]) -> float:
+    count = len(values)
+    if count < 2:
+        return 0.0
+    mean = sum(values) / count
+    return sum((value - mean) ** 2 for value in values) / (count - 1)
+
+
+def _euclid(a, b) -> float:
+    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+
+def overlap_speech(front_sep: float, chat_sep: float, k: float) -> str:
+    """Say which non-trigger pose collided with the lens. Chat is the known false trigger."""
+    chat_bad = chat_sep < k
+    front_bad = front_sep < k
+    lines = []
+    if chat_bad:
+        lines.append(SAY_OVERLAP_CHAT)
+    if front_bad:
+        lines.append(SAY_OVERLAP_FRONT)
+    if not lines:
+        lines.append(SAY_RETRY)
+    lines.append("No file was saved. Run calibrate again.")
+    return " ".join(lines)
+
+
+def fit_multicam_gate(
+    frames_by_pose: dict,
+    *,
+    min_frames: int = MIN_CALIBRATION_FRAMES,
+    k: float = SEPARATION_K,
+    trigger_progress: float = TRIGGER_PROGRESS,
+) -> PitchGate:
+    """Nearest centroid in pooled-std units. BRIO head pose is the main signal.
+
+    The C920 frontal score is kept when it actually separates a look into that
+    lens from the other two poses. Features that barely move are dropped.
+    A pair closer than k within-pose standard deviations fails closed.
+    """
+    poses = ("front", "chat", "lens")
+    columns = {pose: [] for pose in poses}
+    for pose in poses:
+        for frame in frames_by_pose.get(pose) or []:
+            if not isinstance(frame, dict):
+                continue
+            if any(_finite(frame.get(name)) is None for name in FEATURE_NAMES):
+                continue
+            columns[pose].append({name: float(frame[name]) for name in FEATURE_NAMES})
+        if len(columns[pose]) < min_frames:
+            return _invalid_gate(
+                f"{pose} pose kept {len(columns[pose])} confident frames; need at least {min_frames}. "
+                "The front camera has to see the nose and both eyes. "
+                "calibration.yaml was not written. Automatic cutaways stay off. "
+                "No scene change was made."
+            )
+    means = {pose: {} for pose in poses}
+    stds = {pose: {} for pose in poses}
+    for name in FEATURE_NAMES:
+        for pose in poses:
+            series = [frame[name] for frame in columns[pose]]
+            means[pose][name] = sum(series) / len(series)
+            stds[pose][name] = math.sqrt(_variance(series))
+    scales = {}
+    kept = []
+    dropped = []
+    for name in FEATURE_NAMES:
+        pooled = math.sqrt(sum(_variance(
+            [frame[name] for frame in columns[pose]]
+        ) for pose in poses) / len(poses))
+        spread = max(
+            abs(means["lens"][name] - means["front"][name]),
+            abs(means["lens"][name] - means["chat"][name]),
+        )
+        if pooled < 1e-6:
+            if spread < 1e-6:
+                dropped.append(name)
+                continue
+            pooled = max(spread, 1e-3)
+        helpful = spread / pooled
+        if helpful < 1.0:
+            dropped.append(name)
+            continue
+        scales[name] = pooled
+        kept.append(name)
+    report = _feature_report(means, stds, scales, kept, dropped)
+    if not kept:
+        gate = _invalid_gate(
+            "No feature separated the lens from the other poses. "
+            "Pitch from the side camera is often too small; the front camera's "
+            "up-down and sideways nose offset have to move. "
+            + report
+            + " calibration.yaml was not written. Automatic cutaways stay off. "
+            "No scene change was made."
+        )
+        gate.report = report
+        gate.spoken = overlap_speech(0.0, 0.0, k)
+        return gate
+    sep_front = _feature_distance(means["front"], means["lens"], kept, scales)
+    sep_chat = _feature_distance(means["chat"], means["lens"], kept, scales)
+    report += (
+        f"front-lens separation {sep_front:.2f} std. "
+        f"chat-lens separation {sep_chat:.2f} std. "
+        f"Need at least {k:.1f}.\n"
+    )
+    if sep_front < k or sep_chat < k:
+        spoken = overlap_speech(sep_front, sep_chat, k)
+        gate = _invalid_gate(report + spoken + " Automatic cutaways stay off. No scene change was made.")
+        gate.report = report
+        gate.spoken = spoken
+        gate.sep_front = sep_front
+        gate.sep_chat = sep_chat
+        return gate
+    note = (
+        "Kept " + ", ".join(kept) + ". "
+        + ("Dropped " + ", ".join(dropped) + ". " if dropped else "")
+        + "Head pitch and yaw come from the front BRIO. "
+        "The C920 adds whether that lens sees a frontal face, when that signal separates the poses. "
+        "A cutaway has to be nearer the lens centroid than both straight-ahead and chat."
+    )
+    gate = PitchGate(
+        means["chat"].get("brio_pitch", 0.0),
+        means["lens"].get("brio_pitch", 0.0),
+        True,
+        "",
+        float(trigger_progress),
+        MIN_PITCH_SEPARATION,
+        front_pitch=means["front"].get("brio_pitch", 0.0),
+        front_yaw=means["front"].get("brio_yaw", 0.0),
+        chat_yaw=means["chat"].get("brio_yaw", 0.0),
+        lens_yaw=means["lens"].get("brio_yaw", 0.0),
+        axis_note=note,
+        kept=tuple(kept),
+        scales=scales,
+        means=means,
+        stds=stds,
+        sep_front=sep_front,
+        sep_chat=sep_chat,
+        report=report,
+        spoken="",
+        separation_k=float(k),
+    )
+    return gate
+
+
+def _feature_distance(a: dict, b: dict, kept, scales) -> float:
+    acc = 0.0
+    for name in kept:
+        delta = (float(a[name]) - float(b[name])) / float(scales[name])
+        acc += delta * delta
+    return math.sqrt(acc)
+
+
+def _feature_report(means, stds, scales, kept, dropped) -> str:
+    lines = []
+    for name in FEATURE_NAMES:
+        lines.append(
+            "{name} front mean={fm:.3f} std={fs:.3f}  chat mean={cm:.3f} std={cs:.3f}  "
+            "lens mean={lm:.3f} std={ls:.3f}  pooled_std={pool}".format(
+                name=name,
+                fm=means["front"][name], fs=stds["front"][name],
+                cm=means["chat"][name], cs=stds["chat"][name],
+                lm=means["lens"][name], ls=stds["lens"][name],
+                pool="dropped" if name not in scales else f"{scales[name]:.3f}",
+            )
+        )
+    lines.append("kept: " + (", ".join(kept) if kept else "none"))
+    if dropped:
+        lines.append("dropped: " + ", ".join(dropped))
+    return "\n".join(lines) + "\n"
+
+
+def multicam_gate_from_mapping(data) -> PitchGate:
+    kept = tuple(data.get("kept") or ())
+    scales = data.get("scales") or {}
+    means = data.get("means") or {}
+    if not kept or not isinstance(scales, dict) or not isinstance(means, dict):
+        return _invalid_gate(
+            "calibration.yaml version 3 is incomplete. Run .\\run.ps1 -Calibrate. "
+            "Automatic cutaways stay off. No scene change was made."
+        )
+    if any(name not in FEATURE_NAMES for name in kept):
+        return _invalid_gate(
+            "calibration.yaml has an unknown feature. Run .\\run.ps1 -Calibrate. "
+            "Automatic cutaways stay off. No scene change was made."
+        )
+    for pose in ("front", "chat", "lens"):
+        block = means.get(pose)
+        if not isinstance(block, dict) or any(_finite(block.get(name)) is None for name in kept):
+            return _invalid_gate(
+                "calibration.yaml is missing a pose mean. Run .\\run.ps1 -Calibrate. "
+                "Automatic cutaways stay off. No scene change was made."
+            )
+    clean_scales = {}
+    for name in kept:
+        scale = _finite(scales.get(name))
+        if scale is None or scale < 1e-9:
+            return _invalid_gate(
+                "calibration.yaml has a bad feature scale. Run .\\run.ps1 -Calibrate. "
+                "Automatic cutaways stay off. No scene change was made."
+            )
+        clean_scales[name] = float(scale)
+    sep_front = _feature_distance(means["front"], means["lens"], kept, clean_scales)
+    sep_chat = _feature_distance(means["chat"], means["lens"], kept, clean_scales)
+    # Ignore a hand-edited separation_k. The fit-time bar stays in force.
+    if sep_front < SEPARATION_K or sep_chat < SEPARATION_K:
+        return _invalid_gate(
+            overlap_speech(sep_front, sep_chat, SEPARATION_K)
+            + " Automatic cutaways stay off. No scene change was made."
+        )
+    return PitchGate(
+        float(means["chat"].get("brio_pitch", means["chat"][kept[0]])),
+        float(means["lens"].get("brio_pitch", means["lens"][kept[0]])),
+        True,
+        "",
+        TRIGGER_PROGRESS,
+        MIN_PITCH_SEPARATION,
+        front_pitch=float(means["front"].get("brio_pitch", 0.0)),
+        front_yaw=float(means["front"].get("brio_yaw", 0.0)),
+        chat_yaw=float(means["chat"].get("brio_yaw", 0.0)),
+        lens_yaw=float(means["lens"].get("brio_yaw", 0.0)),
+        axis_note="Loaded BRIO head pose plus any C920 features that separated the poses.",
+        kept=tuple(kept),
+        scales=clean_scales,
+        means=means,
+        sep_front=sep_front,
+        sep_chat=sep_chat,
+        separation_k=SEPARATION_K,
+    )
 
 
 def missing_calibration_gate() -> PitchGate:
@@ -500,6 +790,8 @@ def _point(pitch, yaw):
 
 
 def _sample(value):
+    if isinstance(value, dict):
+        return value
     if isinstance(value, tuple) and len(value) == 2:
         return _point(value[0], value[1])
     return _finite(value)
@@ -685,13 +977,16 @@ class CutawayController:
         now: float,
         c920_pitch=None,
         c920_yaw=None,
+        pose=None,
     ) -> Decision | None:
         self._sanitize()
         self.last_pitch = _finite(c920_pitch)
         self.last_yaw = _finite(c920_yaw)
         self.last_pitch_progress = None
         gate = self.pitch_gate
-        if gate is not None and gate.valid and self.last_pitch is not None:
+        if gate is not None and gate.valid and gate.kept:
+            self.last_pitch_progress = gate.pose_progress(pose)
+        elif gate is not None and gate.valid and self.last_pitch is not None:
             self.last_pitch_progress = gate.lens_progress(self.last_pitch, self.last_yaw)
         if not self.enabled or self.defer_decisions:
             self._clear_pending()
@@ -709,7 +1004,7 @@ class CutawayController:
             return None
         if scene == self.c920_scene:
             return self._decide_return(brio, c920, now)
-        return self._decide_cutaway(brio, c920, now, scene, c920_pitch, c920_yaw)
+        return self._decide_cutaway(brio, c920, now, scene, c920_pitch, c920_yaw, pose)
 
     def commit(self, decision: Decision, now: float) -> bool:
         if decision.kind == "cutaway":
@@ -738,13 +1033,13 @@ class CutawayController:
         return True
 
     def _decide_cutaway(
-        self, brio: float, c920: float, now: float, scene: str, pitch, yaw=None,
+        self, brio: float, c920: float, now: float, scene: str, pitch, yaw=None, pose=None,
     ) -> Decision | None:
         if scene == self.c920_scene or not self._looking_at_c920(brio, c920):
             if self.pending == "to_c920":
                 self._clear_pending()
             return None
-        if not self._pitch_allows(pitch, yaw):
+        if not self._pitch_allows(pitch, yaw, pose):
             # Chat can look frontal on the C920. Do not let that time count as a look-up.
             if self.pending == "to_c920":
                 self._clear_pending()
@@ -771,7 +1066,7 @@ class CutawayController:
             return None
         return Decision("return", dest, None)
 
-    def _pitch_allows(self, pitch, yaw=None) -> bool:
+    def _pitch_allows(self, pitch, yaw=None, pose=None) -> bool:
         gate = self.pitch_gate
         if gate is None or not gate.valid:
             reason = gate.reason if gate is not None else missing_calibration_gate().reason
@@ -779,6 +1074,8 @@ class CutawayController:
                 self._pitch_block_logged = reason
                 self.pitch_notice = reason
             return False
+        if gate.kept:
+            return gate.allows_pose(pose)
         return gate.allows(pitch, yaw)
 
     def _looking_at_c920(self, brio: float, c920: float) -> bool:
@@ -1019,6 +1316,7 @@ def run_once(
         brio, c920, now,
         c920_pitch=scores.get("c920_pitch"),
         c920_yaw=scores.get("c920_yaw"),
+        pose=scores.get("pose"),
     )
     if ctrl.pitch_notice:
         logs.append(ctrl.pitch_notice)

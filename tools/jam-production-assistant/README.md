@@ -50,9 +50,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install-update.ps1 -Rollba
 
 The flag is already off. One command. The computer talks. Cap does not read the screen. Live cuts stay at 0.25 s. The three-second holds are calibration only.
 
-Looking straight ahead, reading chat, and looking into the C920 are three different neck movements. The false trigger is reading chat, not sitting straight at the main screen. The chat pose is required. Straight-ahead is required too, and it does not stand in for chat. If pitch (up/down in the image) cannot separate a pose from the lens, the sideways nose offset is used as well. If the two together still overlap, no file is written.
+Head pitch and yaw are measured on the front BRIO (`Video Capture Device`). The C920 is only an extra signal for whether that lens sees a frontal face. The side camera barely sees a head tilt, which is why a C920-only calibration overlapped. Each feature is divided by its within-pose noise. A pose pair has to be at least 2 of those standard deviations apart. Features that do not move are ignored. If the lens still overlaps straight-ahead or chat, no file is written.
 
-Prompts use the normal Windows speakers. Nothing here changes mute, the mixer, or the stream. If desktop audio is on the stream, viewers will hear the prompts.
+Prompts use the normal Windows speakers through PowerShell. Nothing here changes mute, the mixer, or the stream. If desktop audio is on the stream, viewers will hear the prompts. If the voice check is silent, PowerShell may be muted in the Windows volume mixer.
 
 ```powershell
 cd D:\TheForge\Dev\jam-production-assistant

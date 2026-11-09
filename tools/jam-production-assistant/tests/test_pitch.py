@@ -24,6 +24,7 @@ from cutaway import (  # noqa: E402
     PitchGate,
     apply_runtime_mode,
     calibration_brief,
+    fit_multicam_gate,
     fit_pitch_gate,
     fit_pose_gate,
     pitch_gate_from_mapping,
@@ -358,6 +359,102 @@ class PitchGateTests(unittest.TestCase):
                 Path("ignored.yaml"), fit_pose_gate([(0.2, 0.0)], [(0.2, 0.2)], [(0.2, 0.4)]),
                 front_frames=1, chat_frames=1, lens_frames=1,
             )
+
+
+class MulticamAndLightTests(unittest.TestCase):
+    def _pose(self, pitch, yaw, frontal, n=8, noise=0.01):
+        frames = []
+        for i in range(n):
+            jitter = (i - (n - 1) / 2) * noise
+            frames.append({
+                "brio_pitch": pitch + jitter,
+                "brio_yaw": yaw + jitter * 0.2,
+                "c920_frontal": frontal,
+                "c920_pitch": 0.50,
+                "c920_yaw": 0.50,
+            })
+        return frames
+
+    def test_brio_separates_when_c920_pose_does_not(self):
+        gate = fit_multicam_gate({
+            "front": self._pose(0.05, 0.00, 0.10),
+            "chat": self._pose(0.10, 0.70, 0.20),
+            "lens": self._pose(0.80, 0.55, 0.85),
+        })
+        self.assertTrue(gate.valid, gate.reason)
+        self.assertIn("brio_pitch", gate.kept)
+        self.assertNotIn("c920_pitch", gate.kept)
+        self.assertIn("brio_pitch", gate.report)
+        self.assertIn("front mean=", gate.report)
+        self.assertIn("chat-lens separation", gate.report)
+        self.assertFalse(gate.allows_pose(gate.means["front"]))
+        self.assertFalse(gate.allows_pose(gate.means["chat"]))
+        self.assertTrue(gate.allows_pose(gate.means["lens"]))
+        ctrl = fast_ctrl()
+        ctrl.pitch_gate = gate
+        client = FakeObs("Desktop")
+        chat = {"brio": 0.1, "c920": 0.9, "pose": dict(gate.means["chat"])}
+        tick(ctrl, client, 0.0, chat)
+        tick(ctrl, client, 1.0, chat)
+        self.assertEqual(client.writes, [])
+        lens = {"brio": 0.1, "c920": 0.9, "pose": dict(gate.means["lens"])}
+        tick(ctrl, client, 2.0, lens)
+        tick(ctrl, client, 2.25, lens)
+        self.assertEqual(client.writes, ["C920"])
+
+    def test_adaptive_threshold_uses_within_pose_noise(self):
+        # Absolute gap is under the old 0.15 eye-distance floor, but the clusters are tight.
+        tight = fit_multicam_gate({
+            "front": self._pose(0.00, 0.00, 0.1, noise=0.002),
+            "chat": self._pose(0.02, 0.40, 0.1, noise=0.002),
+            "lens": self._pose(0.08, 0.35, 0.9, noise=0.002),
+        })
+        self.assertTrue(tight.valid, tight.reason)
+        self.assertGreaterEqual(tight.sep_chat, 2.0)
+        # Same small gap drowned in noise. Chat overlaps the lens.
+        noisy = self._pose(0.70, 0.40, 0.2, noise=0.05)
+        lens = self._pose(0.74, 0.42, 0.25, noise=0.05)
+        front = self._pose(0.00, 0.00, 0.1, noise=0.01)
+        overlap = fit_multicam_gate({"front": front, "chat": noisy, "lens": lens})
+        self.assertFalse(overlap.valid)
+        self.assertIn("Chat and camera looked the same", overlap.spoken)
+        self.assertIn("chin", overlap.spoken)
+        self.assertNotIn("Straight ahead and the camera looked the same", overlap.spoken)
+
+    def test_front_overlap_message_is_separate(self):
+        overlap = fit_multicam_gate({
+            "front": self._pose(0.80, 0.50, 0.4, noise=0.04),
+            "chat": self._pose(0.05, -0.60, 0.1, noise=0.01),
+            "lens": self._pose(0.84, 0.52, 0.45, noise=0.04),
+        })
+        self.assertFalse(overlap.valid)
+        self.assertIn("Straight ahead and the camera looked the same", overlap.spoken)
+        self.assertNotIn("Chat and camera looked the same", overlap.spoken)
+
+    def test_preprocess_stretches_dark_and_red_and_leaves_bright_frames(self):
+        import numpy as np
+        from PIL import Image
+        import gaze_switcher
+        bright = Image.fromarray(np.full((40, 40, 3), 180, np.uint8), "RGB")
+        same = gaze_switcher.prepare_frame(bright, "auto")
+        self.assertTrue(np.array_equal(np.asarray(bright), np.asarray(same)))
+        dark_arr = np.full((40, 40, 3), 8, np.uint8)
+        dark_arr[10:20, 10:20] = 22
+        dark = Image.fromarray(dark_arr, "RGB")
+        dark_out = np.asarray(gaze_switcher.prepare_frame(dark, "auto"))
+        self.assertGreater(float(dark_out.max()) - float(dark_out.min()), 100)
+        red = np.zeros((40, 40, 3), np.uint8)
+        red[:, :, 0] = 40
+        red[5:15, 5:15, 0] = 110
+        red[:, :, 1] = 6
+        red[:, :, 2] = 5
+        red_out = np.asarray(gaze_switcher.prepare_frame(Image.fromarray(red, "RGB"), "auto"))
+        self.assertTrue(np.all(red_out[:, :, 0] == red_out[:, :, 1]))
+        self.assertGreater(float(red_out.max()), 200)
+        self.assertIn(
+            "PowerShell is not muted",
+            inspect.getsource(gaze_switcher.calibrate),
+        )
 
 
 if __name__ == "__main__":

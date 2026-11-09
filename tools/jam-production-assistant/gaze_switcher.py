@@ -44,7 +44,7 @@ from cutaway import (
     apply_runtime_mode,
     calibration_brief,
     controller_from_config,
-    fit_pose_gate,
+    fit_multicam_gate,
     inventory_problems,
     missing_calibration_gate,
     pitch_gate_from_mapping,
@@ -296,13 +296,79 @@ def grab(cl, source: str, width: int, height: int, quality: int) -> Image.Image:
         raise GrabError(screenshot_failure_message(source, type(exc).__name__)) from exc
 
 
+def preprocess_settings(cfg) -> tuple[str, float]:
+    block = cfg.get("preprocess") if isinstance(cfg, dict) else None
+    if not isinstance(block, dict):
+        block = {}
+    mode = str(block.get("mode", "auto")).lower()
+    try:
+        low = float(block.get("low_light_mean", 50))
+    except (TypeError, ValueError):
+        low = 50.0
+    return mode, low
+
+
+def separation_k_from_config(cfg) -> float:
+    from cutaway import SEPARATION_K
+    block = cfg.get("calibrate") if isinstance(cfg, dict) else None
+    if not isinstance(block, dict):
+        return SEPARATION_K
+    try:
+        k = float(block.get("separation_k", SEPARATION_K))
+    except (TypeError, ValueError):
+        return SEPARATION_K
+    return min(6.0, max(1.0, k))
+
+
+def prepare_frame(image, mode: str = "auto", low_light_mean: float = 50.0):
+    """Stretch dim or red frames before pose inference. Bright frames stay as shot."""
+    rgb = image.convert("RGB")
+    arr = np.asarray(rgb, dtype=np.float32)
+    if arr.ndim != 3 or arr.shape[2] != 3 or arr.size == 0:
+        return rgb
+    luma = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+    mean = float(luma.mean())
+    red_cast = float(arr[:, :, 0].mean()) > 1.35 * max(float(arr[:, :, 1].mean()), 1.0) and mean < 90.0
+    if mode == "off":
+        return rgb
+    if mode == "auto" and mean >= float(low_light_mean) and not red_cast:
+        return rgb
+    lo = float(np.percentile(luma, 2))
+    hi = float(np.percentile(luma, 98))
+    if hi - lo < 8.0:
+        return rgb
+    stretched = np.clip((luma - lo) * (255.0 / (hi - lo)), 0, 255).astype(np.uint8)
+    return Image.fromarray(np.stack([stretched, stretched, stretched], axis=-1), "RGB")
+
+
+def pose_reading(brio_person, c920_person, min_conf: float, max_yaw: float):
+    """BRIO supplies head pitch and yaw. C920 supplies a frontal-face score plus its own pose."""
+    brio = pose_features_from_person(brio_person, min_conf)
+    if brio is None:
+        return None
+    c920 = pose_features_from_person(c920_person, min_conf)
+    frontal, _why = frontal_score(c920_person, min_conf, max_yaw)
+    return {
+        "brio_pitch": brio[0],
+        "brio_yaw": brio[1],
+        "c920_frontal": float(frontal),
+        "c920_pitch": 0.0 if c920 is None else c920[0],
+        "c920_yaw": 0.0 if c920 is None else c920[1],
+    }
+
+
 def score_cameras(cl, model, cfg, brio_source: str, c920_source: str):
     detect = cfg["detect"]
     cap = cfg["capture"]
+    mode, low = preprocess_settings(cfg)
     scores, notes = {}, {}
+    people = {}
     for key, source in (("brio", brio_source), ("c920", c920_source)):
-        img = grab(cl, source, cap["width"], cap["height"], cap["quality"])
+        img = prepare_frame(
+            grab(cl, source, cap["width"], cap["height"], cap["quality"]), mode, low,
+        )
         person = main_person(model(img))
+        people[key] = person
         score, why = frontal_score(person, detect["keypoint_conf"], detect["max_yaw"])
         scores[key] = score
         notes[key] = why
@@ -313,6 +379,9 @@ def score_cameras(cl, model, cfg, brio_source: str, c920_source: str):
                 scores["c920_yaw"] = None
             else:
                 scores["c920_pitch"], scores["c920_yaw"] = features
+    scores["pose"] = pose_reading(
+        people.get("brio"), people.get("c920"), detect["keypoint_conf"], detect["max_yaw"],
+    )
     return scores, notes
 
 
@@ -376,7 +445,27 @@ def windows_speak(text: str, runner=None) -> None:
 
 
 def save_pitch_gate(path: Path, gate, *, front_frames: int, chat_frames: int, lens_frames: int) -> None:
-    if not gate.valid or not gate.uses_yaw:
+    if not gate.valid:
+        raise RuntimeError("refusing to write an invalid calibration")
+    if gate.kept:
+        document = {
+            "version": 3,
+            "feature": "brio_pose_and_c920",
+            "kept": list(gate.kept),
+            "scales": {name: round(float(gate.scales[name]), 6) for name in gate.kept},
+            "means": {
+                pose: {name: round(float(gate.means[pose][name]), 4) for name in gate.kept}
+                for pose in ("front", "chat", "lens")
+            },
+            "separation_k": float(gate.separation_k),
+            "front_frames": int(front_frames),
+            "chat_frames": int(chat_frames),
+            "lens_frames": int(lens_frames),
+            "note": gate.axis_note,
+        }
+        path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+        return
+    if not gate.uses_yaw:
         raise RuntimeError("refusing to write a calibration that does not separate straight-ahead, chat, and lens")
     document = {
         "version": 2,
@@ -410,6 +499,8 @@ def calibrate(cfg) -> int:
             log.error("%s", err)
         return 2
     log.info("%s", calibration_brief())
+    print("If you hear nothing, check that PowerShell is not muted in Windows Volume Mixer.")
+    log.info("If you hear nothing, check that PowerShell is not muted in Windows Volume Mixer.")
     if not prepare_calibration_voice(_speak_and_log, log.error):
         return 2
     log.info(
@@ -449,9 +540,24 @@ def calibrate(cfg) -> int:
         period = 1.0 / float(cap["fps"])
         min_conf = float(cfg["detect"]["keypoint_conf"])
 
+        mode, low = preprocess_settings(cfg)
+        brio_source = str(cfg["cameras"]["brio"]["source"])
+
         def measure():
-            image = grab(adapter.client, source, cap["width"], cap["height"], cap["quality"])
-            return pose_features_from_person(main_person(model(image)), min_conf)
+            brio_image = prepare_frame(
+                grab(adapter.client, brio_source, cap["width"], cap["height"], cap["quality"]),
+                mode, low,
+            )
+            c920_image = prepare_frame(
+                grab(adapter.client, source, cap["width"], cap["height"], cap["quality"]),
+                mode, low,
+            )
+            return pose_reading(
+                main_person(model(brio_image)),
+                main_person(model(c920_image)),
+                min_conf,
+                float(cfg["detect"]["max_yaw"]),
+            )
 
         try:
             _speak_and_log(SAY_ENTER)
@@ -482,11 +588,16 @@ def calibrate(cfg) -> int:
         return 2
     finally:
         model.close()
-    gate = fit_pose_gate(front_samples, chat_samples, lens_samples)
+    gate = fit_multicam_gate(
+        {"front": front_samples, "chat": chat_samples, "lens": lens_samples},
+        k=separation_k_from_config(cfg),
+    )
+    if gate.report:
+        log.info("%s", gate.report)
     if not gate.valid:
         log.error("%s", gate.reason)
         try:
-            _speak_and_log(SAY_RETRY)
+            _speak_and_log(gate.spoken or SAY_RETRY)
         except SpeechError as exc:
             log.error("Could not speak the retry cue (%s).", exc)
         return 2
@@ -651,11 +762,14 @@ def run(cfg, dry: bool, duration: float | None) -> int:
         brio_source, c920_source, ctrl.c920_scene,
     )
     if pitch_gate.valid:
-        log.info(
-            "Pitch gate on: chat %.2f, lens %.2f, trigger progress %.2f. "
-            "Frontal score alone does not cut to C920.",
-            pitch_gate.chat_pitch, pitch_gate.lens_pitch, pitch_gate.trigger_progress,
-        )
+        if pitch_gate.kept:
+            log.info("%s", pitch_gate.axis_note)
+        else:
+            log.info(
+                "Pitch gate on: chat %.2f, lens %.2f, trigger progress %.2f. "
+                "Frontal score alone does not cut to C920.",
+                pitch_gate.chat_pitch, pitch_gate.lens_pitch, pitch_gate.trigger_progress,
+            )
     else:
         log.warning("%s", pitch_gate.reason)
     period = 1.0 / float(cfg["capture"]["fps"])
@@ -763,15 +877,16 @@ def run(cfg, dry: bool, duration: float | None) -> int:
             for line in lines:
                 _log_decision(line)
             if notes and (cfg.get("verbose") or now - last_status > float(cfg.get("status_every_s", 5))):
-                pitch = scores.get("c920_pitch")
-                yaw = scores.get("c920_yaw")
+                pose = scores.get("pose") or {}
                 progress = ctrl.last_pitch_progress
+                def _num(value):
+                    return "none" if value is None else f"{value:.2f}"
                 log.info(
-                    "scores brio=%.2f (%s)  c920=%.2f (%s)  c920_pitch=%s  c920_yaw=%s  progress=%s  "
-                    "scene=%s  remembered=%s",
+                    "scores brio=%.2f (%s)  c920=%.2f (%s)  brio_pitch=%s  brio_yaw=%s  "
+                    "c920_frontal=%s  progress=%s  scene=%s  remembered=%s",
                     scores["brio"], notes["brio"], scores["c920"], notes["c920"],
-                    "none" if pitch is None else f"{pitch:.2f}",
-                    "none" if yaw is None else f"{yaw:.2f}",
+                    _num(pose.get("brio_pitch")), _num(pose.get("brio_yaw")),
+                    _num(pose.get("c920_frontal")),
                     "none" if progress is None else f"{progress:.2f}",
                     ctrl.logical_scene, ctrl.return_scene,
                 )
