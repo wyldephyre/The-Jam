@@ -1,0 +1,52 @@
+# Jam Production Assistant - look-up cutaway to the C920 scene.
+# Names must match OBS exactly (case and spaces). Check with:  .\run.ps1 -ListObs
+# The OBS websocket password is read from OBS's own config. It is not stored here.
+
+obs:
+  host: localhost
+  # port + password are read at runtime from OBS's own websocket config (never stored here)
+  websocket_config: '%APPDATA%\obs-studio\plugin_config\obs-websocket\config.json'
+
+cameras:
+  brio:                                  # Logitech BRIO, the main view
+    source: "Video Capture Device"
+    dwell_s: 0.25                        # look back this long before returning
+  c920:                                  # upper-right Logitech HD Pro Webcam C920
+    source: "C920 Source"
+    scene: "C920"                        # dedicated program scene, exact name
+    dwell_s: 0.25                        # look up this long before cutting away
+
+capture:
+  width: 640
+  height: 360          # match the cam aspect (16:9 -> 360)
+  quality: 70          # JPEG quality of OBS source screenshots
+  fps: 8               # decision ticks per second (each tick grabs both sources)
+
+model:
+  hef: models/yolov8s_pose.hef
+  conf: 0.5            # person detection threshold
+
+detect:
+  keypoint_conf: 0.5   # nose + both eyes must be at least this confident
+  max_yaw: 0.6         # nose offset / eye distance at which the frontal score hits 0
+  enter: 0.45          # frontal score required before a look can win
+  stay: 0.30           # the other camera keeps the shot while it scores above this
+  margin: 0.15         # challenger must beat the current camera by this much
+  cooldown_s: 0.6      # minimum time between cuts
+
+enable_flag: switcher.on         # file present = ON. toggle.ps1 creates/removes it
+dry_run: false
+status_every_s: 5
+log_dir: logs
+ack_grace_s: 1.0                 # wait this long for OBS to confirm a cut before trusting a mismatch
+
+# Optional. Missing keys use these defaults. Dim or red frames are stretched before pose inference.
+preprocess:
+  mode: auto
+  low_light_mean: 50
+
+# Optional. Lens must sit this many within-pose standard deviations from both other poses.
+calibrate:
+  separation_k: 2.0
+# calibration.yaml is created by -Calibrate and is not stored here.
+# Missing or invalid calibration disables automatic cutaways. It does not change scenes.

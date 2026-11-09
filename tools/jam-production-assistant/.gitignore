@@ -1,0 +1,8 @@
+.venv/
+logs/
+models/*.hef
+switcher.on
+calibration.yaml
+__pycache__/
+rollback/
+*.pyc
