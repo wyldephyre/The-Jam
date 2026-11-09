@@ -8,7 +8,7 @@ The app is already a Zo-style site: one Bun process, Hono, server-rendered pages
 
 Register an **HTTP service**. Zo restarts the machine for updates, and a process started in a terminal does not come back. A registered service does.
 
-Use a public service. Viewers open the link from chat and do not have Zo accounts. The site still asks for `VIEWER_PASSWORD` before the hub, song requests, or live chat.
+Use a public service. Viewers open the link from chat and do not have Zo accounts. They create a viewer account on the site (their chat username and a password) before they can request a song or send a message. If `VIEWER_PASSWORD` is set, they also enter that shared password first. It is a site gate, not their identity.
 
 A private Zo URL (`*.zo.computer`) only works for people signed into the workspace. That is the wrong visibility for the viewer hub.
 
@@ -38,8 +38,12 @@ Edit `.env`. Bun loads it on `bun run start` and does not override variables Zo 
 
 Required or the process exits:
 
-- `VIEWER_PASSWORD`
 - `ADMIN_PASSWORD`
+
+Optional:
+
+- `VIEWER_PASSWORD` — shared site gate in front of account login. Leave it empty to send viewers straight to `/login`. Clearing it does not turn off account login.
+- `COOKIE_SECURE` — set to `1` on the public HTTPS site so the `jam_session` cookie is always marked Secure. Leave it empty if Zo sends `X-Forwarded-Proto: https` (the app will mark the cookie Secure from that). Set `0` only for plain HTTP on localhost. If login succeeds in the browser but the hub immediately asks for login again, set `COOKIE_SECURE=1` and restart.
 
 Needed for song search and queue (the site still boots without them; search returns an error until they are set):
 
@@ -123,7 +127,7 @@ Keep SSN and those chat pages open while live. A closed or sleeping source stops
 
 ### Speaking an approved Jam message
 
-Approving a **message** request sends that text to Social Stream Ninja so the dock can read it aloud. Song approvals stay on the Spotify path. The viewer's Jam username is the chat name, or `Jam viewer` if they never set one. In the dock the platform label is `external`. The payload also includes `source` set to `The Jam`. This is injected as incoming chat inside SSN. It is not posted into Twitch, YouTube, Rumble, or X.
+Approving a **message** request sends that text to Social Stream Ninja so the dock can read it aloud. Song approvals stay on the Spotify path. The chat name is the viewer's account display name (the Twitch / YouTube / Rumble / X username they signed up with). In the dock the platform label is `external`. The payload also includes `source` set to `The Jam`. This is injected as incoming chat inside SSN. It is not posted into Twitch, YouTube, Rumble, or X.
 
 Nothing is sent when `SSN_SESSION_ID` is empty. If SSN cannot be reached, the approval still succeeds.
 
@@ -152,18 +156,44 @@ SSN_SERVER_URL=ws://127.0.0.1:3003
 
 The default hosted URL is the right one when capture stays on the streaming PC and the site runs on Niner.
 
-## 6. After it is up
+## 6. Database migration
 
-- Viewer link: `https://<public-host>/`
-- Admin: `https://<public-host>/?admin=true`
+Pulling this version and restarting is enough. Do not delete `the-jam.db`. On startup the process runs an in-place migration:
+
+- New tables `users` and `sessions` are created if missing.
+- `requests` gains a nullable `user_id` column if it does not already have one. Existing rows are left as they are (`user_id` stays null) and still show the old viewer username.
+- Loyalty rows in `viewers` are not rewritten.
+
+The migration is safe to run more than once. There is no manual SQL step. A restart does not wipe the file.
+
+New song and message requests store `user_id` and use the account display name. Old requests keep working.
+
+## 7. After it is up
+
+- Viewer link: `https://<public-host>/` (shared gate if `VIEWER_PASSWORD` is set, then account login)
+- Account login: `https://<public-host>/login`
+- Admin: `https://<public-host>/?admin=true` — Pending refreshes on its own. Accounts tab can disable or delete a viewer.
 - OBS now-playing text: `https://<public-host>/api/overlay/current`
-- SQLite data is `the-jam.db` in the working directory. It survives a service restart. Do not commit it.
+- OBS browser source: `https://<public-host>/overlay`
+- SQLite data is `the-jam.db` in the working directory. It survives a service restart. Do not commit it. Do not set `JAM_DB_PATH` on Niner.
 
-Song requests, loyalty time, and the admin queue behave as before. Live chat is an extra tab. It stays empty, with "Chat is not configured on the server", until `SSN_SESSION_ID` is set and SSN is publishing.
+The up-next line is added under the existing now-playing line when Spotify has an active player. It lists the next three queued tracks. Approved Jam songs get `(Requested by <display name>)` when the Spotify URI matches. If Spotify errors or nothing is playing, that line is omitted and the now-playing line is unchanged. The Spotify refresh token needs `user-read-playback-state` and `user-read-currently-playing`.
+
+Song requests, loyalty time, and the admin queue behave as before, except a request now has to come from a logged-in account. Live chat is an extra tab. It stays empty, with "Chat is not configured on the server", until `SSN_SESSION_ID` is set and SSN is publishing. Pending and live chat also poll (30s and 5s) if the live socket misses an update.
+
+## What Cap still has to do at deploy
+
+- Pull this branch and restart the service (`bun run start`). Leave `the-jam.db` in place.
+- Keep `ADMIN_PASSWORD`. Decide whether `VIEWER_PASSWORD` stays as a shared gate or is cleared.
+- Set `COOKIE_SECURE=1` if the public site is HTTPS and the login cookie does not stick.
+- No new required secrets. Spotify and SSN env vars are unchanged.
+- Ask one viewer to create an account with their chat username, send a message, and confirm the admin queue and (after approval) the SSN dock show that name.
+- While a song is playing in Spotify, open `/overlay` and confirm the up-next line. If it never appears, the refresh token is missing a playback scope.
+- There is no password-reset email. Disable or delete an account from Admin → Accounts if someone is locked out, and they can sign up again.
 
 ## What Cap still has to decide
 
-- The viewer and admin passwords, and the Spotify app credentials.
+- Whether the shared `VIEWER_PASSWORD` stays, and the admin password and Spotify app credentials.
 - The SSN session id (and password, if he set one), taken from his own SSN install.
 - That SSN will keep running on the streaming PC with the two toggles above, plus dock TTS on if approved Jam messages should be spoken. This repo does not run capture. See "Speaking an approved Jam message" above.
 - The Zo account handle, which determines `the-jam-<handle>.zocomputer.io`.

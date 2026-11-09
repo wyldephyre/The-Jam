@@ -59,6 +59,19 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${PORT}/
 code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${PORT}/api/auth/verify" -H 'content-type: application/json' -d '{"password":"nope","type":"viewer"}')
 [[ "$code" == "401" ]]
 
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${PORT}/api/requests/submit" \
+  -H 'content-type: application/json' \
+  -H "x-viewer-password: ${VIEWER_PASSWORD}" \
+  -d '{"type":"message","content":"smoke should not post","username":"not-an-account"}')
+[[ "$code" == "401" ]]
+
+curl -sf -o /dev/null "http://127.0.0.1:${PORT}/api/overlay/current"
+overlay_html=$(curl -sf "http://127.0.0.1:${PORT}/overlay")
+if grep -q 'SmokeSession1' <<<"$overlay_html"; then
+  echo "overlay HTML leaked the SSN session id" >&2
+  exit 1
+fi
+
 ticket_json=$(curl -sf -X POST "http://127.0.0.1:${PORT}/api/chat/ticket" -H 'content-type: application/json' -H "x-viewer-password: ${VIEWER_PASSWORD}" -d '{}')
 grep -q '"ticket"' <<<"$ticket_json"
 if grep -q 'SmokeSession1\|smoke-ssn-secret' <<<"$ticket_json"; then
