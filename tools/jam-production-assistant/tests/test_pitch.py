@@ -11,16 +11,27 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from cutaway import (  # noqa: E402
+    CAL_CYCLES,
+    CAL_SETTLE_S,
     MIN_PITCH_SEPARATION,
+    SAY_AGAIN,
+    SAY_CHAT,
+    SAY_FRONT,
+    SAY_LENS,
+    SAY_VOICE_CHECK,
     TRIGGER_PROGRESS,
     CutawayController,
     PitchGate,
     apply_runtime_mode,
-    collect_pitch_samples,
+    calibration_brief,
     fit_pitch_gate,
+    fit_pose_gate,
     pitch_gate_from_mapping,
     pitch_proxy,
     pitch_proxy_from_person,
+    prepare_calibration_voice,
+    run_calibration_timer,
+    yaw_proxy,
 )
 from test_cutaway import FakeObs, look_brio, look_c920, lens_gate, tick  # noqa: E402
 
@@ -51,6 +62,9 @@ class PitchGeometryTests(unittest.TestCase):
         self.assertAlmostEqual(shifted, 1.0)
         self.assertAlmostEqual(rolled, 1.0)
         self.assertIsNone(pitch_proxy((0, 0), (0, 0), (0, 0)))
+        self.assertAlmostEqual(yaw_proxy((0, 20), (-10, 0), (10, 0)), 0.0)
+        self.assertAlmostEqual(yaw_proxy((12, 20), (-10, 0), (10, 0)), 0.6)
+        self.assertAlmostEqual(pitch_proxy((12, 20), (-10, 0), (10, 0)), below)
 
     def test_low_confidence_is_not_a_pitch(self):
         person = {"kpts": [[0, 20, 0.2], [-10, 0, 0.9], [10, 0, 0.9]]}
@@ -145,25 +159,63 @@ class PitchGateTests(unittest.TestCase):
 
     def test_saved_file_cannot_lower_the_trigger(self):
         loaded = pitch_gate_from_mapping({
-            "version": 1,
-            "feature": "eye_line_pitch_proxy",
-            "chat_pitch": 0.0,
-            "lens_pitch": 1.0,
+            "version": 2,
+            "feature": "pitch_and_yaw",
+            "front_pitch": 0.0, "front_yaw": 0.0,
+            "chat_pitch": 0.05, "chat_yaw": 0.8,
+            "lens_pitch": 0.9, "lens_yaw": 0.8,
             "trigger_progress": 0.0,
         })
         self.assertTrue(loaded.valid)
         self.assertEqual(loaded.trigger_progress, TRIGGER_PROGRESS)
-        self.assertFalse(loaded.allows(0.2))
-        self.assertTrue(loaded.allows(1.0))
-        broken = pitch_gate_from_mapping({
-            "version": 1,
-            "feature": "eye_line_pitch_proxy",
-            "chat_pitch": 0.4,
-            "lens_pitch": 0.45,
+        self.assertFalse(loaded.allows(0.05, 0.8))
+        self.assertFalse(loaded.allows(0.0, 0.0))
+        self.assertTrue(loaded.allows(0.9, 0.8))
+        self.assertFalse(loaded.allows(0.9))
+        old = pitch_gate_from_mapping({
+            "version": 1, "feature": "eye_line_pitch_proxy",
+            "chat_pitch": 0.0, "lens_pitch": 1.0,
         })
-        self.assertFalse(broken.valid)
-        self.assertFalse(pitch_gate_from_mapping({"version": 2}).valid)
+        self.assertFalse(old.valid)
+        self.assertIn("straight-ahead", old.reason)
         self.assertFalse(pitch_gate_from_mapping(None).valid)
+
+    def test_front_and_chat_both_block_and_pitch_gap_can_fail_closed(self):
+        gate = fit_pose_gate([(0.0, 0.0)] * 6, [(0.05, 0.9)] * 6, [(0.8, 0.85)] * 6)
+        self.assertTrue(gate.valid)
+        self.assertFalse(gate.allows(0.0, 0.0))
+        self.assertFalse(gate.allows(0.05, 0.9))
+        self.assertTrue(gate.allows(0.8, 0.85))
+        # Same up/down number as the lens, but the sideways offset is still straight ahead.
+        self.assertFalse(gate.allows(0.8, 0.0))
+        ctrl = fast_ctrl()
+        ctrl.pitch_gate = gate
+        client = FakeObs("Desktop")
+        for pose in ((0.0, 0.0), (0.05, 0.9)):
+            scores = {"brio": 0.1, "c920": 0.95, "c920_pitch": pose[0], "c920_yaw": pose[1]}
+            tick(ctrl, client, 0.0, scores)
+            tick(ctrl, client, 1.0, scores)
+            self.assertEqual(client.writes, [])
+        lens = {"brio": 0.1, "c920": 0.95, "c920_pitch": 0.8, "c920_yaw": 0.85}
+        tick(ctrl, client, 2.0, lens)
+        tick(ctrl, client, 2.25, lens)
+        self.assertEqual(client.writes, ["C920"])
+
+        # Chat sits on the lens pitch. Sideways offset still separates them.
+        yaw_saved = fit_pose_gate([(0.2, 0.0)] * 6, [(0.70, 0.1)] * 6, [(0.75, 1.0)] * 6)
+        self.assertTrue(yaw_saved.valid)
+        self.assertIn("Pitch alone does not separate", yaw_saved.axis_note)
+        self.assertIn("chat", yaw_saved.axis_note)
+        self.assertFalse(yaw_saved.allows(0.70, 0.1))
+        self.assertFalse(yaw_saved.allows(0.2, 0.0))
+        self.assertTrue(yaw_saved.allows(0.75, 1.0))
+
+        # Neither axis separates. Do not write a gate.
+        overlap = fit_pose_gate([(0.50, 0.50)] * 6, [(0.52, 0.55)] * 6, [(0.55, 0.58)] * 6)
+        self.assertFalse(overlap.valid)
+        self.assertIn("Pitch alone", overlap.reason)
+        self.assertIn("chat", overlap.reason)
+        self.assertIn("not written", overlap.reason)
 
     def test_return_ignores_pitch_and_manual_change_still_clears_memory(self):
         ctrl = fast_ctrl()
@@ -219,59 +271,93 @@ class PitchGateTests(unittest.TestCase):
         blocked = tick(live, FakeObs("Ending"), 0.0, look_c920(), dry=False)
         self.assertTrue(any("off" in line.lower() for line in blocked), blocked)
 
-    def test_countdown_is_three_one_second_beats_then_a_one_second_capture(self):
-        sleeps = []
-        logs = []
-        samples = collect_pitch_samples(
-            measure=lambda: 0.33,
-            sleep=sleeps.append,
-            log=logs.append,
-            label="1 of 2 CHAT",
-            instructions="Turn toward chat. Do not look up into the C920.",
-            countdown=(3, 2, 1),
-            capture_s=1.0,
-            period=0.125,
-            min_frames=5,
-        )
-        self.assertEqual(sleeps[:3], [1.0, 1.0, 1.0])
-        self.assertEqual(len(sleeps), 11)
-        self.assertTrue(all(item == 0.125 for item in sleeps[3:]))
-        self.assertEqual(logs[2:5], ["3", "2", "1"])
-        self.assertTrue(any(line.startswith("Capturing now") for line in logs))
-        self.assertEqual(len(samples), 8)
-        sparse = iter([None, None, None, 0.2, 0.2, 0.2, 0.2, 0.2])
-        kept = collect_pitch_samples(
-            measure=lambda: next(sparse),
-            sleep=lambda _s: None,
-            log=lambda _m: None,
-            label="2 of 2 LENS",
-            instructions="Look into the lens.",
-            period=0.125,
-        )
-        self.assertEqual(kept, [0.2, 0.2, 0.2, 0.2, 0.2])
+    def test_spoken_holds_start_after_the_cue_and_repeat(self):
+        events = []
 
-    def test_calibration_round_trip_and_calibrate_never_switches(self):
+        def speak(text):
+            events.append(("speak", text))
+
+        def sleep(seconds):
+            events.append(("sleep", seconds))
+
+        def measure():
+            events.append(("measure",))
+            return (0.2, 0.1)
+
+        front, chat, lens = run_calibration_timer(
+            measure, sleep, lambda message: events.append(("log", message)), speak,
+            period=0.125, hold_s=3.0, settle_s=CAL_SETTLE_S, trim_s=0.5, cycles=2,
+        )
+        speaks = [item[1] for item in events if item[0] == "speak"]
+        self.assertEqual(speaks[0], SAY_FRONT)
+        self.assertEqual(speaks.count(SAY_FRONT), CAL_CYCLES)
+        self.assertEqual(speaks.count(SAY_CHAT), CAL_CYCLES)
+        self.assertEqual(speaks.count(SAY_LENS), CAL_CYCLES)
+        self.assertEqual(speaks.count(SAY_AGAIN), 1)
+        self.assertLess(events.index(("speak", SAY_FRONT)), events.index(("measure",)))
+        # After each pose sentence, the next thing is the unsampled settle, then capture.
+        for phrase in (SAY_FRONT, SAY_CHAT, SAY_LENS):
+            start = events.index(("speak", phrase))
+            self.assertEqual(events[start + 1][0], "log")
+            self.assertEqual(events[start + 2], ("sleep", CAL_SETTLE_S))
+            self.assertEqual(events[start + 3], ("measure",))
+        # 3s at 8 fps is 24 frames; 0.5s trimmed off each end leaves 16 per hold.
+        self.assertEqual(len(front), CAL_CYCLES * 16)
+        self.assertEqual(len(chat), CAL_CYCLES * 16)
+        self.assertEqual(len(lens), CAL_CYCLES * 16)
+        self.assertIn(SAY_CHAT, calibration_brief())
+        self.assertIn("does not replace the chat sample", calibration_brief())
+
+    def test_voice_check_failure_does_not_start(self):
+        heard = []
+
+        def speak(text):
+            heard.append(text)
+            raise RuntimeError("no sapi")
+
+        logs = []
+        self.assertFalse(prepare_calibration_voice(speak, logs.append))
+        self.assertEqual(heard, [SAY_VOICE_CHECK])
+        self.assertIn("timer was not started", logs[0])
+        self.assertIn("No calibration file", logs[0])
+
+    def test_calibration_round_trip_and_speech_command_is_offline(self):
         import gaze_switcher
         source = inspect.getsource(gaze_switcher.calibrate)
         self.assertNotIn("set_current_program_scene", source)
         self.assertIn("grab(", source)
-        gate = fit_pitch_gate([0.10] * 8, [0.70] * 8)
+        self.assertIn("prepare_calibration_voice", source)
+        gate = fit_pose_gate([(0.0, 0.0)] * 8, [(0.1, 0.8)] * 8, [(0.7, 0.75)] * 8)
         self.assertTrue(gate.valid)
+        command = " ".join(gaze_switcher.windows_speech_command(SAY_CHAT))
+        self.assertIn("System.Speech", command)
+        self.assertIn("Speak(", command)
+        for banned in ("mute", "AudioEndpoint", "Set-Volume", "http", "Invoke-Web"):
+            self.assertNotIn(banned.lower(), command.lower())
+        with self.assertRaises(gaze_switcher.SpeechError) as caught:
+            gaze_switcher.windows_speak("hello", runner=lambda *args, **kwargs: type("R", (), {"returncode": 1})())
+        self.assertIn("timer was not started", str(caught.exception))
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "calibration.yaml"
-            gaze_switcher.save_pitch_gate(path, gate, 8, 8)
+            gaze_switcher.save_pitch_gate(
+                path, gate, front_frames=8, chat_frames=8, lens_frames=8,
+            )
             text = path.read_text(encoding="utf-8")
             self.assertNotIn("password", text.lower())
+            self.assertIn("version: 2", text)
             loaded = gaze_switcher.load_pitch_gate({"calibration": str(path)})
             self.assertTrue(loaded.valid)
-            self.assertAlmostEqual(loaded.chat_pitch, gate.chat_pitch, places=3)
-            self.assertFalse(loaded.allows(gate.chat_pitch))
-            self.assertTrue(loaded.allows(gate.lens_pitch))
+            self.assertFalse(loaded.allows(gate.chat_pitch, gate.chat_yaw))
+            self.assertFalse(loaded.allows(gate.front_pitch, gate.front_yaw))
+            self.assertTrue(loaded.allows(gate.lens_pitch, gate.lens_yaw))
             missing = gaze_switcher.load_pitch_gate({"calibration": str(Path(tmp) / "nope.yaml")})
             self.assertFalse(missing.valid)
             self.assertIn("Calibrate", missing.reason)
         with self.assertRaises(RuntimeError):
-            gaze_switcher.save_pitch_gate(Path("ignored.yaml"), fit_pitch_gate([0.2], [0.9]), 1, 1)
+            gaze_switcher.save_pitch_gate(
+                Path("ignored.yaml"), fit_pose_gate([(0.2, 0.0)], [(0.2, 0.2)], [(0.2, 0.4)]),
+                front_frames=1, chat_frames=1, lens_frames=1,
+            )
 
 
 if __name__ == "__main__":

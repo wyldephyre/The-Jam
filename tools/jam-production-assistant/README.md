@@ -48,18 +48,30 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install-update.ps1 -Rollba
 
 ## Calibrate while you are on stream
 
-The switcher must not be cutting scenes during this. Calibration never calls a scene change, and it does not need `switcher.on`. Each pose is a countdown of 3, 2, 1 (one second apart) and then a one-second capture. Watch the console. Hold the pose through "Capturing now."
+The flag is already off. One command. The computer talks. Cap does not read the screen. Live cuts stay at 0.25 s. The three-second holds are calibration only.
+
+Looking straight ahead, reading chat, and looking into the C920 are three different neck movements. The false trigger is reading chat, not sitting straight at the main screen. The chat pose is required. Straight-ahead is required too, and it does not stand in for chat. If pitch (up/down in the image) cannot separate a pose from the lens, the sideways nose offset is used as well. If the two together still overlap, no file is written.
+
+Prompts use the normal Windows speakers. Nothing here changes mute, the mixer, or the stream. If desktop audio is on the stream, viewers will hear the prompts.
 
 ```powershell
 cd D:\TheForge\Dev\jam-production-assistant
-.\toggle.ps1 -Off
 .\run.ps1 -Calibrate
 ```
 
-1. **CHAT.** When it says `Pose 1 of 2 CHAT`, turn your head the way you do to read chat on the right monitor. Do not look up into the C920. The countdown starts immediately: 3, 2, 1, then one second of capture.
-2. **LENS.** When it says `Pose 2 of 2 LENS`, look up into the C920 lens and hold. Same countdown, then one second.
-3. If the log says the poses are too similar or a pose had fewer than 5 confident frames, `calibration.yaml` is not written and cutaways stay off. Run `-Calibrate` again with a clearer difference between the two poses.
-4. If it saves the file, it prints both pitch numbers. Leave the flag off and dry-run.
+What he hears, in order:
+
+1. Voice check, including the stream warning. If that sentence does not play, the program stops. The timer does not start and no file is written.
+2. The plan: straight ahead, then chat, then the lens, two rounds, three seconds after each sentence.
+3. "Press Enter when he is ready to look straight ahead." Parent presses Enter once. That is the ready signal.
+4. Round one, then "Same three poses again," then round two. Each pose is: the sentence finishes, 1.5 seconds of quiet, then a 3 second hold. The first and last 0.5 seconds of the hold are dropped.
+   - "Look straight ahead at your main screen. Do not look at chat and do not look up."
+   - "Read your chat normally. Do not look up."
+   - "Look up into the right camera lens."
+5. "Done. You can relax." only if the file was saved.
+6. If the poses overlap or a pose has fewer than 5 confident frames: "That did not work. No file was saved. Run calibrate again."
+
+Then leave the flag off and dry-run.
 
 ## Dry-run while the flag is off
 
@@ -70,9 +82,9 @@ cd D:\TheForge\Dev\jam-production-assistant
 .\run.ps1 -DryRun -Verbose
 ```
 
-Read chat the way you normally do. You should see scores and `c920_pitch` / `progress`, and you should not see `DRY-RUN cutaway`. `progress` for chat should stay under 0.65.
+Read chat the way you normally do, and also look straight ahead at the main screen. You should see pitch, sideways yaw, and progress, and you should not see `DRY-RUN cutaway`.
 
-Look up into the C920 and hold past 0.25 s. The log should show one `DRY-RUN cutaway '<scene you are on>' -> 'C920'` with `pitch_progress` at or above 0.65.
+Look up into the C920 and hold past 0.25 s. The log should show one `DRY-RUN cutaway '<scene you are on>' -> 'C920'`.
 
 Look back at the BRIO and hold past 0.25 s (and past the 0.6 s cooldown). The log should show `DRY-RUN return 'C920' -> '<that same scene>'`.
 
@@ -111,7 +123,7 @@ Mock tests do not open OBS, the webcams, or the Hailo. A customized `config.yaml
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-They cover cutaway from Starting Soon, Chatting, BRB, Desktop, and Ending; return to that scene; no nested C920; manual scene changes; the off flag; dry-run with the flag off; disconnect; a chat-like frontal score versus a calibrated lens pose; a camera whose lens sample is the opposite sign from "nose above eyes"; low confidence; missing and invalid calibration; and the 3-2-1 countdown.
+They cover cutaway from Starting Soon, Chatting, BRB, Desktop, and Ending; return to that scene; no nested C920; manual scene changes; the off flag; dry-run with the flag off; disconnect; a chat-like frontal score versus a calibrated lens pose; a camera whose lens sample is the opposite sign from "nose above eyes"; low confidence; missing and invalid calibration; and the spoken straight-ahead, chat, and lens holds.
 
 ## Not verified on the streaming PC
 

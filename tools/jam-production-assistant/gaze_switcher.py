@@ -26,6 +26,7 @@ import json
 import logging
 import logging.handlers
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -35,17 +36,21 @@ import yaml
 from PIL import Image
 
 from cutaway import (
-    MIN_CALIBRATION_FRAMES,
     MIN_PITCH_SEPARATION,
+    SAY_DONE,
+    SAY_ENTER,
+    SAY_RETRY,
     TRIGGER_PROGRESS,
     apply_runtime_mode,
-    collect_pitch_samples,
+    calibration_brief,
     controller_from_config,
-    fit_pitch_gate,
+    fit_pose_gate,
     inventory_problems,
     missing_calibration_gate,
     pitch_gate_from_mapping,
-    pitch_proxy_from_person,
+    pose_features_from_person,
+    prepare_calibration_voice,
+    run_calibration_timer,
     run_once,
     screenshot_failure_message,
     validate_config,
@@ -302,7 +307,12 @@ def score_cameras(cl, model, cfg, brio_source: str, c920_source: str):
         scores[key] = score
         notes[key] = why
         if key == "c920":
-            scores["c920_pitch"] = pitch_proxy_from_person(person, detect["keypoint_conf"])
+            features = pose_features_from_person(person, detect["keypoint_conf"])
+            if features is None:
+                scores["c920_pitch"] = None
+                scores["c920_yaw"] = None
+            else:
+                scores["c920_pitch"], scores["c920_yaw"] = features
     return scores, notes
 
 
@@ -326,36 +336,85 @@ def load_pitch_gate(cfg):
     return pitch_gate_from_mapping(data)
 
 
-def save_pitch_gate(path: Path, gate, chat_frames: int, lens_frames: int) -> None:
-    if not gate.valid:
-        raise RuntimeError("refusing to write an invalid pitch calibration")
+class SpeechError(Exception):
+    pass
+
+
+def windows_speech_command(text: str) -> list[str]:
+    """Offline SAPI on the default playback device. Does not change mute or the mixer."""
+    safe = str(text).replace("'", "''")
+    script = (
+        "Add-Type -AssemblyName System.Speech; "
+        "$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+        f"$synth.Speak('{safe}')"
+    )
+    return ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script]
+
+
+def windows_speak(text: str, runner=None) -> None:
+    """Block until Windows finishes speaking. Raise SpeechError instead of continuing silently."""
+    run = runner or subprocess.run
+    try:
+        completed = run(
+            windows_speech_command(text),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception as exc:
+        raise SpeechError(
+            "Windows offline speech failed (" + type(exc).__name__ + "). "
+            "The timer was not started. No calibration file was written. "
+            "No scene change was made."
+        ) from exc
+    if getattr(completed, "returncode", 1) != 0:
+        raise SpeechError(
+            "Windows offline speech failed (exit " + str(getattr(completed, "returncode", "unknown")) + "). "
+            "The timer was not started. No calibration file was written. "
+            "No scene change was made. Speech uses the normal Windows playback device."
+        )
+
+
+def save_pitch_gate(path: Path, gate, *, front_frames: int, chat_frames: int, lens_frames: int) -> None:
+    if not gate.valid or not gate.uses_yaw:
+        raise RuntimeError("refusing to write a calibration that does not separate straight-ahead, chat, and lens")
     document = {
-        "version": 1,
-        "feature": "eye_line_pitch_proxy",
+        "version": 2,
+        "feature": "pitch_and_yaw",
+        "front_pitch": round(float(gate.front_pitch), 4),
+        "front_yaw": round(float(gate.front_yaw), 4),
         "chat_pitch": round(float(gate.chat_pitch), 4),
+        "chat_yaw": round(float(gate.chat_yaw), 4),
         "lens_pitch": round(float(gate.lens_pitch), 4),
+        "lens_yaw": round(float(gate.lens_yaw), 4),
+        "front_frames": int(front_frames),
         "chat_frames": int(chat_frames),
         "lens_frames": int(lens_frames),
         "trigger_progress": TRIGGER_PROGRESS,
         "min_separation": MIN_PITCH_SEPARATION,
-        "note": (
-            "Nose offset perpendicular to the eye line, in eye-distance units. "
-            "Not world pitch and not eye gaze. Redo if the C920 moves."
-        ),
+        "note": gate.axis_note,
     }
     path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
 
 
+def _speak_and_log(message: str) -> None:
+    log.info("%s", message)
+    windows_speak(message)
+
+
 def calibrate(cfg) -> int:
-    """Record chat vs lens pitch from C920 screenshots. Never changes the program scene."""
+    """Three spoken poses from C920 screenshots. Never changes the program scene."""
     errors = validate_config(cfg)
     if errors:
         for err in errors:
             log.error("%s", err)
         return 2
+    log.info("%s", calibration_brief())
+    if not prepare_calibration_voice(_speak_and_log, log.error):
+        return 2
     log.info(
-        "Calibration only. Screenshotting the C920 source. "
-        "No scene, mute, audio, recording, or streaming change will be made."
+        "Voice check passed. Screenshotting the C920 source. "
+        "No scene, mute, audio routing, recording, or streaming change will be made."
     )
     try:
         model = PoseModel(ROOT / cfg["model"]["hef"], cfg["model"]["conf"])
@@ -365,7 +424,6 @@ def calibrate(cfg) -> int:
             type(exc).__name__,
         )
         return 2
-    adapter = None
     try:
         try:
             adapter = connect_obs(cfg)
@@ -384,7 +442,7 @@ def calibrate(cfg) -> int:
         for problem in inventory_problems(
             inputs, scenes, str(cfg["cameras"]["brio"]["source"]), source, str(cfg["cameras"]["c920"]["scene"])
         ):
-            if source in problem or cfg["cameras"]["c920"]["scene"] in problem:
+            if source in problem or str(cfg["cameras"]["c920"]["scene"]) in problem:
                 log.error("%s", problem)
                 return 2
         cap = cfg["capture"]
@@ -393,46 +451,65 @@ def calibrate(cfg) -> int:
 
         def measure():
             image = grab(adapter.client, source, cap["width"], cap["height"], cap["quality"])
-            return pitch_proxy_from_person(main_person(model(image)), min_conf)
+            return pose_features_from_person(main_person(model(image)), min_conf)
 
-        def say(message: str) -> None:
-            log.info("%s", message)
-
-        chat_samples = collect_pitch_samples(
-            measure, time.sleep, say, "1 of 2 CHAT",
-            "Turn your head the way you do when reading chat on the right monitor. "
-            "Do not look up into the C920.",
-            period=period,
-            min_frames=MIN_CALIBRATION_FRAMES,
-        )
-        lens_samples = collect_pitch_samples(
-            measure, time.sleep, say, "2 of 2 LENS",
-            "Look up into the C920 lens and hold still.",
-            period=period,
-            min_frames=MIN_CALIBRATION_FRAMES,
-        )
+        try:
+            _speak_and_log(SAY_ENTER)
+        except SpeechError as exc:
+            log.error("%s", exc)
+            return 2
+        if sys.stdin is not None and sys.stdin.isatty():
+            try:
+                input()
+            except EOFError:
+                log.info("Starting the poses now.")
+        else:
+            log.info("Starting the poses now.")
+        try:
+            front_samples, chat_samples, lens_samples = run_calibration_timer(
+                measure, time.sleep, lambda message: log.info("%s", message), windows_speak,
+                period=period,
+            )
+        except SpeechError as exc:
+            log.error(
+                "Speech failed during the poses (%s). The timer stopped. "
+                "No calibration file was written. No scene change was made.",
+                exc,
+            )
+            return 2
     except GrabError as exc:
         log.error("%s", exc)
         return 2
     finally:
         model.close()
-    gate = fit_pitch_gate(chat_samples, lens_samples)
+    gate = fit_pose_gate(front_samples, chat_samples, lens_samples)
     if not gate.valid:
         log.error("%s", gate.reason)
+        try:
+            _speak_and_log(SAY_RETRY)
+        except SpeechError as exc:
+            log.error("Could not speak the retry cue (%s).", exc)
         return 2
     path = calibration_path(cfg)
-    save_pitch_gate(path, gate, len(chat_samples), len(lens_samples))
-    log.info(
-        "Saved %s. Chat pitch_proxy %.2f (%d frames). Lens pitch_proxy %.2f (%d frames). "
-        "A cutaway needs the live value at least %.0f%% of the way from chat to lens "
-        "(separation %.2f, minimum %.2f).",
-        path.name,
-        gate.chat_pitch, len(chat_samples),
-        gate.lens_pitch, len(lens_samples),
-        TRIGGER_PROGRESS * 100,
-        abs(gate.lens_pitch - gate.chat_pitch),
-        MIN_PITCH_SEPARATION,
+    save_pitch_gate(
+        path, gate,
+        front_frames=len(front_samples),
+        chat_frames=len(chat_samples),
+        lens_frames=len(lens_samples),
     )
+    log.info("%s", gate.axis_note)
+    log.info(
+        "Saved %s. Front (%.2f, %.2f) %d frames. Chat (%.2f, %.2f) %d frames. "
+        "Lens (%.2f, %.2f) %d frames. A cutaway must be nearer the lens than both other poses.",
+        path.name,
+        gate.front_pitch, gate.front_yaw, len(front_samples),
+        gate.chat_pitch, gate.chat_yaw, len(chat_samples),
+        gate.lens_pitch, gate.lens_yaw, len(lens_samples),
+    )
+    try:
+        _speak_and_log(SAY_DONE)
+    except SpeechError as exc:
+        log.error("Saved the file, then speech failed on the done cue (%s).", exc)
     log.info(
         "This is not eye tracking. The Hailo model is unchanged. "
         "Move the C920 and this file is wrong until you calibrate again. "
@@ -687,12 +764,14 @@ def run(cfg, dry: bool, duration: float | None) -> int:
                 _log_decision(line)
             if notes and (cfg.get("verbose") or now - last_status > float(cfg.get("status_every_s", 5))):
                 pitch = scores.get("c920_pitch")
+                yaw = scores.get("c920_yaw")
                 progress = ctrl.last_pitch_progress
                 log.info(
-                    "scores brio=%.2f (%s)  c920=%.2f (%s)  c920_pitch=%s  progress=%s  "
+                    "scores brio=%.2f (%s)  c920=%.2f (%s)  c920_pitch=%s  c920_yaw=%s  progress=%s  "
                     "scene=%s  remembered=%s",
                     scores["brio"], notes["brio"], scores["c920"], notes["c920"],
                     "none" if pitch is None else f"{pitch:.2f}",
+                    "none" if yaw is None else f"{yaw:.2f}",
                     "none" if progress is None else f"{progress:.2f}",
                     ctrl.logical_scene, ctrl.return_scene,
                 )

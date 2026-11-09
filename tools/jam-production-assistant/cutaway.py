@@ -10,6 +10,7 @@ look cannot jump back to somewhere stale.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -38,31 +39,110 @@ class Plan:
 MIN_PITCH_SEPARATION = 0.15
 TRIGGER_PROGRESS = 0.65
 MIN_CALIBRATION_FRAMES = 5
+# Calibration only. Live cutaways stay on cameras.*.dwell_s (0.25s on Forge).
+CAL_HOLD_S = 3.0
+CAL_SETTLE_S = 1.5
+CAL_EDGE_TRIM_S = 0.5
+CAL_CYCLES = 2
+
+SAY_VOICE_CHECK = (
+    "Voice check. If you can hear this, we can start. "
+    "These prompts play through the normal Windows speakers. "
+    "If the stream is hearing the desktop, viewers will hear them. Mute will not be changed."
+)
+SAY_PLAN = (
+    "Three poses, two rounds. Look straight ahead at your main screen. "
+    "Then read your chat normally. Do not look up. "
+    "Then look up into the right camera lens. "
+    "Each hold is three seconds and starts only after I finish talking."
+)
+SAY_ENTER = "Press Enter when he is ready to look straight ahead."
+SAY_FRONT = "Look straight ahead at your main screen. Do not look at chat and do not look up."
+SAY_CHAT = "Read your chat normally. Do not look up."
+SAY_LENS = "Look up into the right camera lens."
+SAY_AGAIN = "Same three poses again."
+SAY_DONE = "Done. You can relax."
+SAY_RETRY = "That did not work. No file was saved. Run calibrate again."
 
 
 @dataclass
 class PitchGate:
+    """Separate the lens pose from both straight-ahead and chat.
+
+    A one-number pitch gate is kept for older tests. A saved calibration also
+    stores the sideways nose offset, because looking right at chat is a different
+    neck movement from looking straight ahead and pitch alone may not separate them.
+    """
+
     chat_pitch: float
     lens_pitch: float
     valid: bool
     reason: str
     trigger_progress: float = TRIGGER_PROGRESS
     min_separation: float = MIN_PITCH_SEPARATION
+    front_pitch: float | None = None
+    front_yaw: float | None = None
+    chat_yaw: float | None = None
+    lens_yaw: float | None = None
+    axis_note: str = ""
+
+    @property
+    def uses_yaw(self) -> bool:
+        return None not in (
+            self.front_pitch, self.front_yaw, self.chat_yaw, self.lens_yaw,
+        )
 
     def progress(self, pitch: float) -> float | None:
         number = _finite(pitch)
-        if number is None or not self.valid:
+        if number is None or not self.valid or self.uses_yaw:
             return None
         span = self.lens_pitch - self.chat_pitch
         if abs(span) < 1e-9:
             return None
         return (number - self.chat_pitch) / span
 
-    def allows(self, pitch) -> bool:
-        prog = self.progress(pitch) if self.valid else None
-        if prog is None:
+    def lens_progress(self, pitch, yaw=None) -> float | None:
+        if not self.valid:
+            return None
+        if not self.uses_yaw:
+            return self.progress(pitch)
+        point = _point(pitch, yaw)
+        if point is None:
+            return None
+        span = min(self._sep_front(), self._sep_chat())
+        if span < 1e-9:
+            return None
+        return 1.0 - _hypot(point, self._lens_point()) / span
+
+    def allows(self, pitch, yaw=None) -> bool:
+        if not self.valid:
             return False
-        return prog >= self.trigger_progress - 1e-9
+        if self.uses_yaw:
+            point = _point(pitch, yaw)
+            if point is None:
+                return False
+            d_lens = _hypot(point, self._lens_point())
+            if not (d_lens < _hypot(point, self._front_point()) and d_lens < _hypot(point, self._chat_point())):
+                return False
+            limit = (1.0 - self.trigger_progress) * min(self._sep_front(), self._sep_chat())
+            return d_lens <= limit + 1e-9
+        prog = self.progress(pitch)
+        return prog is not None and prog >= self.trigger_progress - 1e-9
+
+    def _lens_point(self) -> tuple[float, float]:
+        return (self.lens_pitch, self.lens_yaw)
+
+    def _front_point(self) -> tuple[float, float]:
+        return (self.front_pitch, self.front_yaw)
+
+    def _chat_point(self) -> tuple[float, float]:
+        return (self.chat_pitch, self.chat_yaw)
+
+    def _sep_front(self) -> float:
+        return _hypot(self._lens_point(), self._front_point())
+
+    def _sep_chat(self) -> float:
+        return _hypot(self._lens_point(), self._chat_point())
 
 
 def pitch_proxy(nose, left_eye, right_eye) -> float | None:
@@ -86,6 +166,40 @@ def pitch_proxy(nose, left_eye, right_eye) -> float | None:
     px, py = -ey, ex
     vx, vy = nx - (lx + rx) / 2.0, ny - (ly + ry) / 2.0
     return (vx * px + vy * py) / eye_dist_sq
+
+
+def yaw_proxy(nose, left_eye, right_eye) -> float | None:
+    """Nose offset along the eye line, in eye-distance units."""
+    try:
+        nx, ny = float(nose[0]), float(nose[1])
+        lx, ly = float(left_eye[0]), float(left_eye[1])
+        rx, ry = float(right_eye[0]), float(right_eye[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    ex, ey = rx - lx, ry - ly
+    eye_dist_sq = ex * ex + ey * ey
+    if eye_dist_sq < 1e-6:
+        return None
+    vx, vy = nx - (lx + rx) / 2.0, ny - (ly + ry) / 2.0
+    return (vx * ex + vy * ey) / eye_dist_sq
+
+
+def pose_features_from_person(person, min_conf: float) -> tuple[float, float] | None:
+    if not person:
+        return None
+    try:
+        kpts = person["kpts"]
+        nose, left_eye, right_eye = kpts[0], kpts[1], kpts[2]
+        confs = (float(nose[2]), float(left_eye[2]), float(right_eye[2]))
+    except (KeyError, TypeError, ValueError, IndexError):
+        return None
+    if min(confs) < float(min_conf):
+        return None
+    pitch = pitch_proxy(nose, left_eye, right_eye)
+    yaw = yaw_proxy(nose, left_eye, right_eye)
+    if pitch is None or yaw is None:
+        return None
+    return (pitch, yaw)
 
 
 def pitch_proxy_from_person(person, min_conf: float) -> float | None:
@@ -149,38 +263,116 @@ def fit_pitch_gate(
     )
 
 
-def pitch_gate_from_mapping(data) -> PitchGate:
-    if not isinstance(data, dict) or data.get("version") != 1:
+def fit_pose_gate(
+    front_samples,
+    chat_samples,
+    lens_samples,
+    *,
+    min_frames: int = MIN_CALIBRATION_FRAMES,
+    min_separation: float = MIN_PITCH_SEPARATION,
+    trigger_progress: float = TRIGGER_PROGRESS,
+) -> PitchGate:
+    """Lens must stay clear of both straight-ahead and chat. Pitch alone is not assumed to be enough."""
+    named = (
+        ("straight-ahead", _points(front_samples)),
+        ("chat", _points(chat_samples)),
+        ("lens", _points(lens_samples)),
+    )
+    for label, points in named:
+        if len(points) < min_frames:
+            return _invalid_gate(
+                f"{label} pose kept {len(points)} confident frames; need at least {min_frames}. "
+                "calibration.yaml was not written. Automatic cutaways stay off. "
+                "No scene change was made."
+            )
+    front = _median_point(named[0][1])
+    chat = _median_point(named[1][1])
+    lens = _median_point(named[2][1])
+    pitch_front = abs(lens[0] - front[0])
+    pitch_chat = abs(lens[0] - chat[0])
+    dist_front = _hypot(lens, front)
+    dist_chat = _hypot(lens, chat)
+    if dist_front < min_separation or dist_chat < min_separation:
+        details = []
+        if dist_front < min_separation:
+            details.append(
+                f"straight-ahead is {dist_front:.2f} from the lens "
+                f"(pitch difference {pitch_front:.2f}, sideways {abs(lens[1] - front[1]):.2f})"
+            )
+        if dist_chat < min_separation:
+            details.append(
+                f"chat is {dist_chat:.2f} from the lens "
+                f"(pitch difference {pitch_chat:.2f}, sideways {abs(lens[1] - chat[1]):.2f})"
+            )
         return _invalid_gate(
-            "calibration.yaml is missing or is not version 1. Run .\\run.ps1 -Calibrate. "
+            "The poses overlap, so a look into the lens cannot be separated from "
+            + " and ".join(details)
+            + f". Need at least {min_separation:.2f} on the combined pitch and sideways measure. "
+            "Pitch alone does not describe every neck movement: looking right at chat can leave "
+            "the up-down offset almost unchanged. Straight-ahead is not a stand-in for the chat pose. "
+            "calibration.yaml was not written. Automatic cutaways stay off. No scene change was made."
+        )
+    if pitch_front < min_separation or pitch_chat < min_separation:
+        weak = []
+        if pitch_front < min_separation:
+            weak.append("straight-ahead")
+        if pitch_chat < min_separation:
+            weak.append("chat")
+        note = (
+            "Pitch alone does not separate the lens from " + " and ".join(weak)
+            + ". The sideways nose offset is included. "
+            "A cutaway has to be nearer the lens sample than both straight-ahead and chat. "
+            "Straight-ahead does not replace the chat sample."
+        )
+    else:
+        note = (
+            "Pitch separates the lens from straight-ahead and from chat. "
+            "The gate still requires the live face to be nearer the lens sample than both, "
+            "using pitch and sideways offset together."
+        )
+    return PitchGate(
+        chat[0], lens[0], True, "", float(trigger_progress), float(min_separation),
+        front_pitch=front[0], front_yaw=front[1], chat_yaw=chat[1], lens_yaw=lens[1],
+        axis_note=note,
+    )
+
+
+def pitch_gate_from_mapping(data) -> PitchGate:
+    if not isinstance(data, dict) or data.get("version") != 2:
+        return _invalid_gate(
+            "calibration.yaml is missing or is not version 2 with straight-ahead, chat, and lens. "
+            "An older chat-versus-lens file is not used. Run .\\run.ps1 -Calibrate. "
             "Automatic cutaways stay off. No scene change was made."
         )
-    if data.get("feature") not in (None, "eye_line_pitch_proxy"):
+    if data.get("feature") != "pitch_and_yaw":
         return _invalid_gate(
             "calibration.yaml uses an unknown feature. Run .\\run.ps1 -Calibrate. "
             "Automatic cutaways stay off. No scene change was made."
         )
-    if data.get("feature") is None:
+    values = {
+        name: _finite(data.get(name))
+        for name in (
+            "front_pitch", "front_yaw", "chat_pitch", "chat_yaw", "lens_pitch", "lens_yaw",
+        )
+    }
+    if any(number is None for number in values.values()):
         return _invalid_gate(
-            "calibration.yaml has no feature: eye_line_pitch_proxy entry. "
+            "calibration.yaml is missing one of the straight-ahead, chat, or lens numbers. "
             "Run .\\run.ps1 -Calibrate. Automatic cutaways stay off. No scene change was made."
         )
-    chat = _finite(data.get("chat_pitch"))
-    lens = _finite(data.get("lens_pitch"))
-    if chat is None or lens is None:
-        return _invalid_gate(
-            "calibration.yaml is missing numeric chat_pitch or lens_pitch. "
-            "Run .\\run.ps1 -Calibrate. Automatic cutaways stay off. No scene change was made."
-        )
-    # Ignore any trigger_progress stored in the file. A hand edit must not lower the bar.
-    separation = abs(lens - chat)
-    if separation < MIN_PITCH_SEPARATION:
-        return _invalid_gate(
-            f"Saved calibration separates chat ({chat:.2f}) and lens ({lens:.2f}) by only "
-            f"{separation:.2f}, under {MIN_PITCH_SEPARATION:.2f}. Automatic cutaways stay off. "
-            "Run .\\run.ps1 -Calibrate again. No scene change was made."
-        )
-    return PitchGate(chat, lens, True, "", TRIGGER_PROGRESS, MIN_PITCH_SEPARATION)
+    gate = fit_pose_gate(
+        [(values["front_pitch"], values["front_yaw"])],
+        [(values["chat_pitch"], values["chat_yaw"])],
+        [(values["lens_pitch"], values["lens_yaw"])],
+        min_frames=1,
+    )
+    if not gate.valid:
+        return gate
+    gate.axis_note = (
+        "Loaded three-pose calibration. A cutaway must be nearer the lens than "
+        "both straight-ahead and chat. trigger_progress in the file is ignored."
+    )
+    return gate
 
 
 def missing_calibration_gate() -> PitchGate:
@@ -191,39 +383,85 @@ def missing_calibration_gate() -> PitchGate:
     )
 
 
-def collect_pitch_samples(
+def calibration_brief() -> str:
+    """What the parent tells Cap before Enter. Speech, not a silent countdown, drives the timer."""
+    return (
+        "One command, then one Enter. Cap does not read the screen.\n"
+        "Voice check plays first. If there is no voice, the timer does not start and no file is written.\n"
+        "These prompts use the normal Windows speakers. If the stream hears desktop audio, viewers hear them. "
+        "Mute and the stream mixer are not changed.\n"
+        f"After Enter, two rounds of three poses. Each spoken line finishes, then {CAL_SETTLE_S:.1f}s of quiet, "
+        f"then a {CAL_HOLD_S:.0f}s hold. The first and last {CAL_EDGE_TRIM_S:.1f}s of each hold are dropped.\n"
+        f"  {SAY_FRONT}\n"
+        f"  {SAY_CHAT}\n"
+        f"  {SAY_LENS}\n"
+        "Straight-ahead is a separate neck position from reading chat. Both must stay clear of the lens. "
+        "Looking straight ahead does not replace the chat sample.\n"
+        f"Then: {SAY_DONE}"
+    )
+
+
+def prepare_calibration_voice(speak, log) -> bool:
+    """Play the voice check before any timer. Failure leaves the timer unstarted."""
+    try:
+        speak(SAY_VOICE_CHECK)
+        speak(SAY_PLAN)
+    except Exception as exc:
+        log(
+            "Speech is unavailable (" + type(exc).__name__ + ": " + str(exc) + "). "
+            "The timer was not started. No calibration file was written. No scene change was made."
+        )
+        return False
+    return True
+
+
+def sample_hold(measure, sleep, *, seconds: float, period: float, trim_s: float) -> list:
+    """Sample one hold. Drop the start and end so a pose change is not saved."""
+    frames = max(1, _round_half_up(float(seconds) / float(period)))
+    trim = _round_half_up(float(trim_s) / float(period))
+    if trim < 0 or trim * 2 >= frames:
+        trim = 0
+    kept = []
+    for index in range(frames):
+        sample = _sample(measure())
+        if trim <= index < frames - trim and sample is not None:
+            kept.append(sample)
+        sleep(float(period))
+    return kept
+
+
+def run_calibration_timer(
     measure,
     sleep,
     log,
-    label: str,
-    instructions: str,
+    speak,
     *,
-    countdown=(3, 2, 1),
-    capture_s: float = 1.0,
     period: float = 0.125,
-    min_frames: int = MIN_CALIBRATION_FRAMES,
-) -> list[float]:
-    """Countdown, then screenshot samples. `measure` returns a pitch or None.
-
-    The callable must not switch scenes. Sleep is injected so tests can record
-    the countdown without waiting.
-    """
-    log(f"Pose {label}. {instructions}")
-    log("Get into that pose. Countdown:")
-    for sec in countdown:
-        log(str(sec))
-        sleep(1.0)
-    log("Capturing now. Hold still.")
-    frames = max(int(min_frames), int(round(float(capture_s) / float(period))))
-    samples: list[float] = []
-    for _ in range(frames):
-        value = measure()
-        number = _finite(value)
-        if number is not None:
-            samples.append(number)
-        sleep(float(period))
-    log(f"{label}: {len(samples)} confident frames out of {frames}.")
-    return samples
+    hold_s: float = CAL_HOLD_S,
+    settle_s: float = CAL_SETTLE_S,
+    trim_s: float = CAL_EDGE_TRIM_S,
+    cycles: int = CAL_CYCLES,
+) -> tuple[list, list, list]:
+    """Speak, then settle, then hold. Capture starts only after speak returns."""
+    poses = (("FRONT", SAY_FRONT), ("CHAT", SAY_CHAT), ("LENS", SAY_LENS))
+    kept = {name: [] for name, _phrase in poses}
+    for cycle in range(int(cycles)):
+        if cycle:
+            speak(SAY_AGAIN)
+            log(SAY_AGAIN)
+        for name, phrase in poses:
+            speak(phrase)
+            log(phrase)
+            sleep(float(settle_s))
+            kept[name].extend(sample_hold(
+                measure, sleep, seconds=hold_s, period=period, trim_s=trim_s,
+            ))
+    log(
+        "FRONT kept {0} frames. CHAT kept {1} frames. LENS kept {2} frames.".format(
+            len(kept["FRONT"]), len(kept["CHAT"]), len(kept["LENS"]),
+        )
+    )
+    return kept["FRONT"], kept["CHAT"], kept["LENS"]
 
 
 def detection_active(flag_on: bool, dry: bool) -> bool:
@@ -243,6 +481,41 @@ def apply_runtime_mode(ctrl: "CutawayController", flag_on: bool, dry: bool) -> s
     if flag_on:
         return "switcher ON"
     return "switcher OFF. Pending detections reset. No scene changes while off."
+
+
+def _round_half_up(value: float) -> int:
+    return int(math.floor(float(value) + 0.5))
+
+
+def _hypot(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _point(pitch, yaw):
+    p = _finite(pitch)
+    y = _finite(yaw)
+    if p is None or y is None:
+        return None
+    return (p, y)
+
+
+def _sample(value):
+    if isinstance(value, tuple) and len(value) == 2:
+        return _point(value[0], value[1])
+    return _finite(value)
+
+
+def _points(samples) -> list[tuple[float, float]]:
+    points = []
+    for sample in samples:
+        point = _sample(sample)
+        if isinstance(point, tuple):
+            points.append(point)
+    return points
+
+
+def _median_point(points: list[tuple[float, float]]) -> tuple[float, float]:
+    return (_median([p[0] for p in points]), _median([p[1] for p in points]))
 
 
 def _median(values: list[float]) -> float:
@@ -295,6 +568,7 @@ class CutawayController:
         self.pitch_notice: str | None = None
         self._pitch_block_logged: str | None = None
         self.last_pitch: float | None = None
+        self.last_yaw: float | None = None
         self.last_pitch_progress: float | None = None
 
     def set_enabled(self, on: bool) -> None:
@@ -410,13 +684,15 @@ class CutawayController:
         c920_score: float,
         now: float,
         c920_pitch=None,
+        c920_yaw=None,
     ) -> Decision | None:
         self._sanitize()
         self.last_pitch = _finite(c920_pitch)
+        self.last_yaw = _finite(c920_yaw)
         self.last_pitch_progress = None
         gate = self.pitch_gate
         if gate is not None and gate.valid and self.last_pitch is not None:
-            self.last_pitch_progress = gate.progress(self.last_pitch)
+            self.last_pitch_progress = gate.lens_progress(self.last_pitch, self.last_yaw)
         if not self.enabled or self.defer_decisions:
             self._clear_pending()
             return None
@@ -433,7 +709,7 @@ class CutawayController:
             return None
         if scene == self.c920_scene:
             return self._decide_return(brio, c920, now)
-        return self._decide_cutaway(brio, c920, now, scene, c920_pitch)
+        return self._decide_cutaway(brio, c920, now, scene, c920_pitch, c920_yaw)
 
     def commit(self, decision: Decision, now: float) -> bool:
         if decision.kind == "cutaway":
@@ -462,13 +738,13 @@ class CutawayController:
         return True
 
     def _decide_cutaway(
-        self, brio: float, c920: float, now: float, scene: str, pitch
+        self, brio: float, c920: float, now: float, scene: str, pitch, yaw=None,
     ) -> Decision | None:
         if scene == self.c920_scene or not self._looking_at_c920(brio, c920):
             if self.pending == "to_c920":
                 self._clear_pending()
             return None
-        if not self._pitch_allows(pitch):
+        if not self._pitch_allows(pitch, yaw):
             # Chat can look frontal on the C920. Do not let that time count as a look-up.
             if self.pending == "to_c920":
                 self._clear_pending()
@@ -495,7 +771,7 @@ class CutawayController:
             return None
         return Decision("return", dest, None)
 
-    def _pitch_allows(self, pitch) -> bool:
+    def _pitch_allows(self, pitch, yaw=None) -> bool:
         gate = self.pitch_gate
         if gate is None or not gate.valid:
             reason = gate.reason if gate is not None else missing_calibration_gate().reason
@@ -503,7 +779,7 @@ class CutawayController:
                 self._pitch_block_logged = reason
                 self.pitch_notice = reason
             return False
-        return gate.allows(pitch)
+        return gate.allows(pitch, yaw)
 
     def _looking_at_c920(self, brio: float, c920: float) -> bool:
         if c920 < self.enter:
@@ -739,7 +1015,11 @@ def run_once(
         ctrl._clear_pending()
         logs.append("Pose scores were incomplete. No scene change was made.")
         return logs
-    decision = ctrl.decide(brio, c920, now, c920_pitch=scores.get("c920_pitch"))
+    decision = ctrl.decide(
+        brio, c920, now,
+        c920_pitch=scores.get("c920_pitch"),
+        c920_yaw=scores.get("c920_yaw"),
+    )
     if ctrl.pitch_notice:
         logs.append(ctrl.pitch_notice)
         ctrl.pitch_notice = None
