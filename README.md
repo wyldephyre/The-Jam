@@ -45,6 +45,8 @@ Social Stream Ninja is GPL-3.0 and is not copied into this repo. The Bun process
 
 Setup for the streaming PC and for Niner is in [docs/DEPLOY-ZO.md](docs/DEPLOY-ZO.md). Chat is off until `SSN_SESSION_ID` is set.
 
+Approving a viewer **message** (not a song) also forwards that text to Social Stream Ninja for the dock's text-to-speech. The forward is skipped when `SSN_SESSION_ID` is unset, and a failure to reach SSN does not fail the approval. Which SSN toggles have to be on so the dock actually speaks the line is in the deploy doc.
+
 ## Environment
 
 | Variable | Purpose |
