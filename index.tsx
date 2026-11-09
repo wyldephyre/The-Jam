@@ -19,6 +19,7 @@ import {
 import { searchTracks, addToQueue } from "./spotify";
 import { addClient, removeClient, broadcast } from "./sse";
 import { chatHub } from "./ssn";
+import { forwardApprovedMessage } from "./ssn-publish";
 import { getSsnRelay, startSsnRelay } from "./ssn-relay";
 import { htmlPage, GATE_BODY, GATE_SCRIPT, HUB_BODY, HUB_SCRIPT, ADMIN_BODY, ADMIN_SCRIPT } from "./pages";
 
@@ -258,6 +259,13 @@ app.post("/api/admin/requests/:id/approve", adminAuth, async (c) => {
   }
   const updated: RequestWithViewer = { ...request, status: "approved" };
   broadcast("request", updated);
+  // Pass the pre-update request so a second approve does not speak it again.
+  // forwardApprovedMessage returns immediately; a down SSN cannot fail this response.
+  try {
+    forwardApprovedMessage(request);
+  } catch (error) {
+    console.error("SSN message forward failed:", error instanceof Error ? error.message : "unknown error");
+  }
   return c.json({ success: true, request: updated });
 });
 

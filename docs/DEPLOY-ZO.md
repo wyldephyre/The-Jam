@@ -121,6 +121,25 @@ On the computer where the chats are open (the streaming PC, not necessarily Nine
 
 Keep SSN and those chat pages open while live. A closed or sleeping source stops capture.
 
+### Speaking an approved Jam message
+
+Approving a **message** request sends that text to Social Stream Ninja so the dock can read it aloud. Song approvals stay on the Spotify path. The viewer's Jam username is the chat name, or `Jam viewer` if they never set one. In the dock the platform label is `external`. The payload also includes `source` set to `The Jam`. This is injected as incoming chat inside SSN. It is not posted into Twitch, YouTube, Rumble, or X.
+
+Nothing is sent when `SSN_SESSION_ID` is empty. If SSN cannot be reached, the approval still succeeds.
+
+For TTS to actually speak the line, on the streaming PC:
+
+1. Leave **Enable remote API control of extension** on. That is the switch that lets The Jam hand the message to the extension. The extension then delivers it to the dock the same way it delivers captured chat.
+2. Leave the SSN dock open while you are live.
+3. Turn **TTS on in the dock** (the TTS control in the dock menu). With that on, the dock reads each visible incoming message, including these Jam lines. TTS on the featured overlay only (the featured page, or `featured.html` with `&speech`) speaks messages you feature. Approving a Jam message does not feature it, so featured-only TTS stays quiet.
+4. Clear filters that would hide or skip this source. The line is not a donation, a membership, or a `!say` command, and its source type is `external`:
+   - Dock display filters such as show-Twitch-only, donations only, or members only hide the row, and a hidden row is not spoken.
+   - TTS filters do the same: donations only (`ttsdonos` on the dock URL), members only (`membertts`), a source allow-list (`ttssources`) that does not include `external`, or "only bots / mods / VIPs".
+   - A TTS command such as `!say` (`ttscommand`) speaks those command messages. If the dock TTS toggle itself is off, Jam messages are not spoken, because they are not chat commands.
+   - The extension's members-only chat filter drops the message before it reaches the dock.
+
+Approve one test message from the admin page and confirm it shows in the dock under source `external` and that the dock voice reads the viewer name and the text. Song approvals do not go to SSN.
+
 Leave SSN's session id and password out of OBS links you post in public chat. Viewers of The Jam never receive them; the Bun process joins `wss://io.socialstream.ninja` itself and only forwards plain text.
 
 ### Local websocket instead of the hosted relay
@@ -146,6 +165,6 @@ Song requests, loyalty time, and the admin queue behave as before. Live chat is 
 
 - The viewer and admin passwords, and the Spotify app credentials.
 - The SSN session id (and password, if he set one), taken from his own SSN install.
-- That SSN will keep running on the streaming PC with the two toggles above. This repo does not run capture.
+- That SSN will keep running on the streaming PC with the two toggles above, plus dock TTS on if approved Jam messages should be spoken. This repo does not run capture. See "Speaking an approved Jam message" above.
 - The Zo account handle, which determines `the-jam-<handle>.zocomputer.io`.
 - Whether the public host stays on `zocomputer.io` or gets a paid-plan subdomain, and which DNS host holds the CNAME.
