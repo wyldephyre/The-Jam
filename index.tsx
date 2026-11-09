@@ -1,45 +1,90 @@
 import { Hono } from "hono";
+import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import {
-  getViewer,
-  upsertViewer,
-  setViewerUsername,
-  getAllViewers,
-  toggleViewerRegular,
-  getRequests,
-  getRequest,
-  getApprovedRequests,
-  insertRequest,
-  updateRequestStatus,
-  getOverlay,
-  setOverlay,
   clearOverlay,
-  type Viewer,
+  createAccount,
+  deleteAccount,
+  deleteSessionByHash,
+  getAccountByNameKey,
+  getAccountBySessionHash,
+  getApprovedRequests,
+  getApprovedSongCredits,
+  getAllViewers,
+  getOverlay,
+  getRequest,
+  getRequests,
+  getViewer,
+  insertRequest,
+  insertSession,
+  listAccounts,
+  purgeExpiredSessions,
+  setAccountBanned,
+  setOverlay,
+  toPublicAccount,
+  toggleViewerRegular,
+  updateRequestStatus,
+  upsertViewer,
+  type Account,
+  type PublicAccount,
   type RequestWithViewer,
+  type Viewer,
 } from "./db";
-import { searchTracks, addToQueue } from "./spotify";
+import { searchTracks, addToQueue, getUpcomingTracks, invalidateQueueCache } from "./spotify";
+import { buildOverlayText } from "./overlay-line";
 import { addClient, removeClient, broadcast } from "./sse";
 import { chatHub } from "./ssn";
 import { forwardApprovedMessage } from "./ssn-publish";
 import { getSsnRelay, startSsnRelay } from "./ssn-relay";
-import { htmlPage, GATE_BODY, GATE_SCRIPT, HUB_BODY, HUB_SCRIPT, ADMIN_BODY, ADMIN_SCRIPT } from "./pages";
+import {
+  ADMIN_BODY,
+  ADMIN_SCRIPT,
+  GATE_BODY,
+  GATE_SCRIPT,
+  HUB_BODY,
+  HUB_SCRIPT,
+  LOGIN_BODY,
+  LOGIN_SCRIPT,
+  OVERLAY_BODY,
+  OVERLAY_SCRIPT,
+  htmlPage,
+} from "./pages";
+import {
+  SESSION_COOKIE,
+  SESSION_TTL_SECONDS,
+  allowAuthAttempt,
+  cleanDisplayName,
+  cleanEmail,
+  cleanPassword,
+  cleanPlatform,
+  clientIp,
+  hashPassword,
+  hashSessionToken,
+  newSessionToken,
+  sessionCookieSecure,
+  verifyPassword,
+} from "./auth";
 
-// Refuse to start without both passwords. An unset/empty password must never
-// mean "no password needed".
-const VIEWER_PASSWORD = process.env.VIEWER_PASSWORD ?? "";
+// ADMIN_PASSWORD is required. VIEWER_PASSWORD is an optional shared site gate:
+// when it is set, viewer pages and viewer APIs still require x-viewer-password.
+// It is not an identity. Song and message requests always require a viewer
+// account session, and the name on the request comes from that account.
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ?? "";
-const missingEnv = [
-  !VIEWER_PASSWORD.trim() && "VIEWER_PASSWORD",
-  !ADMIN_PASSWORD.trim() && "ADMIN_PASSWORD",
-].filter(Boolean);
-if (missingEnv.length > 0) {
+if (!ADMIN_PASSWORD.trim()) {
   console.error(
-    `FATAL: ${missingEnv.join(" and ")} must be set to a non-empty value. ` +
-      "Refusing to start without passwords. Copy .env.example and fill them in."
+    "FATAL: ADMIN_PASSWORD must be set to a non-empty value. Refusing to start. " +
+      "Copy .env.example and fill it in. VIEWER_PASSWORD is optional; when set it is only a shared site gate."
   );
   process.exit(1);
 }
 
+declare module "hono" {
+  interface ContextVariableMap {
+    account: PublicAccount;
+  }
+}
+
 const app = new Hono();
+export { app };
 const PORT = parseInt(process.env.PORT || "3000");
 const REGULAR_THRESHOLD = parseInt(process.env.REGULAR_THRESHOLD_MINUTES || "18000", 10);
 
@@ -50,7 +95,10 @@ function viewerToJson(v: Viewer) {
 import type { Context, Next } from "hono";
 import { createHash, timingSafeEqual } from "node:crypto";
 
-// Constant-time compare. Anything that is not a string (e.g. a missing header) never matches.
+function siteGateEnabled(): boolean {
+  return (process.env.VIEWER_PASSWORD ?? "").trim().length > 0;
+}
+
 function passwordMatches(given: unknown, expected: string): boolean {
   if (typeof given !== "string" || given.length === 0 || expected.length === 0) return false;
   const a = createHash("sha256").update(given).digest();
@@ -58,16 +106,18 @@ function passwordMatches(given: unknown, expected: string): boolean {
   return timingSafeEqual(a, b);
 }
 
-// ---- Input validation helpers -------------------------------------------
+function gateOk(c: Context): boolean {
+  if (!siteGateEnabled()) return true;
+  return passwordMatches(c.req.header("x-viewer-password"), process.env.VIEWER_PASSWORD ?? "");
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SPOTIFY_TRACK_URI_RE = /^spotify:track:[A-Za-z0-9]{1,64}$/;
-const MAX_USERNAME = 30;
 const MAX_MESSAGE = 500;
 const MAX_SONG_FIELD = 200;
 
 type Body = Record<string, unknown>;
 
-// Returns the parsed JSON object, or null if the body is missing, not JSON, or not an object.
 async function readJson(c: Context): Promise<Body | null> {
   try {
     const body = await c.req.json();
@@ -83,24 +133,65 @@ function cleanViewerId(v: unknown): string | null {
   return typeof v === "string" && UUID_RE.test(v) ? v.toLowerCase() : null;
 }
 
-// Single-line text: control characters (incl. newlines) become spaces, trimmed, 1..max chars.
 function cleanLine(v: unknown, max: number): string | null {
   if (typeof v !== "string") return null;
   const s = v.replace(/[\u0000-\u001F\u007F]+/g, " ").trim();
   return s.length >= 1 && s.length <= max ? s : null;
 }
 
-// Multi-line text (messages): drop control characters except tab/newline, trimmed, 1..max chars.
 function cleanMessage(v: unknown, max: number): string | null {
   if (typeof v !== "string") return null;
   const s = v.replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "").trim();
   return s.length >= 1 && s.length <= max ? s : null;
 }
 
-async function viewerAuth(c: Context, next: Next) {
-  if (!passwordMatches(c.req.header("x-viewer-password"), VIEWER_PASSWORD)) {
-    return c.json({ error: "Invalid password" }, 401);
+function nowSeconds(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+function sessionAccount(c: Context): Account | null {
+  const token = getCookie(c, SESSION_COOKIE);
+  if (!token || token.length < 20 || token.length > 200) return null;
+  return getAccountBySessionHash(hashSessionToken(token), nowSeconds());
+}
+
+function setSessionCookie(c: Context, token: string) {
+  setCookie(c, SESSION_COOKIE, token, {
+    httpOnly: true,
+    secure: sessionCookieSecure(c),
+    sameSite: "Lax",
+    path: "/",
+    maxAge: SESSION_TTL_SECONDS,
+  });
+}
+
+function clearSessionCookie(c: Context) {
+  const token = getCookie(c, SESSION_COOKIE);
+  if (token && token.length >= 20 && token.length <= 200) deleteSessionByHash(hashSessionToken(token));
+  deleteCookie(c, SESSION_COOKIE, {
+    path: "/",
+    httpOnly: true,
+    secure: sessionCookieSecure(c),
+    sameSite: "Lax",
+  });
+}
+
+function issueSession(c: Context, userId: string) {
+  purgeExpiredSessions(nowSeconds());
+  const token = newSessionToken();
+  insertSession(hashSessionToken(token), userId, nowSeconds() + SESSION_TTL_SECONDS);
+  setSessionCookie(c, token);
+}
+
+async function accountAuth(c: Context, next: Next) {
+  if (!gateOk(c)) return c.json({ error: "Invalid password" }, 401);
+  const account = sessionAccount(c);
+  if (!account) return c.json({ error: "Login required" }, 401);
+  if (account.banned) {
+    clearSessionCookie(c);
+    return c.json({ error: "This account is disabled" }, 403);
   }
+  c.set("account", toPublicAccount(account));
   await next();
 }
 
@@ -111,12 +202,15 @@ async function adminAuth(c: Context, next: Next) {
   await next();
 }
 
-// Auth
+const tooMany = (c: Context) => c.json({ error: "Too many attempts. Try again later." }, 429);
+
+app.get("/api/auth/config", (c) => c.json({ siteGate: siteGateEnabled() }));
+
 app.post("/api/auth/verify", async (c) => {
   const body = await readJson(c);
   if (!body) return badBody(c);
   const { password, type } = body;
-  if (type === "viewer" && passwordMatches(password, VIEWER_PASSWORD)) {
+  if (type === "viewer" && siteGateEnabled() && passwordMatches(password, process.env.VIEWER_PASSWORD ?? "")) {
     return c.json({ valid: true });
   }
   if (type === "admin" && passwordMatches(password, ADMIN_PASSWORD)) {
@@ -125,14 +219,79 @@ app.post("/api/auth/verify", async (c) => {
   return c.json({ valid: false, error: "Invalid password" }, 401);
 });
 
-// Time
-app.post("/api/time/log", viewerAuth, async (c) => {
+app.post("/api/auth/signup", async (c) => {
+  if (!allowAuthAttempt("signup", clientIp(c))) return tooMany(c);
+  if (!gateOk(c)) return c.json({ error: "Invalid password" }, 401);
   const body = await readJson(c);
   if (!body) return badBody(c);
-  const viewerId = cleanViewerId(body.viewerId);
-  if (!viewerId) return c.json({ error: "valid viewerId (UUID) required" }, 400);
-  const before = getViewer(viewerId);
-  const viewer = upsertViewer(viewerId, 1, REGULAR_THRESHOLD);
+  const name = cleanDisplayName(body.displayName);
+  if (!name) {
+    return c.json(
+      {
+        error:
+          "Username must be 2-40 characters and use letters, numbers, spaces, periods, underscores, hyphens, or apostrophes.",
+      },
+      400
+    );
+  }
+  const platform = cleanPlatform(body.platform);
+  if (!platform) return c.json({ error: "Choose a platform: twitch, youtube, rumble, x, kick, or other." }, 400);
+  const password = cleanPassword(body.password);
+  if (!password) return c.json({ error: "Password must be at least 8 characters." }, 400);
+  const email = cleanEmail(body.email);
+  if (email === "invalid") return c.json({ error: "Email looks invalid." }, 400);
+  const passwordHash = await hashPassword(password);
+  const created = createAccount({
+    displayName: name.displayName,
+    displayNameKey: name.key,
+    platform,
+    email,
+    passwordHash,
+  });
+  if (!created.ok) {
+    const error = created.reason === "email" ? "That email is already in use." : "That username is already taken.";
+    return c.json({ error }, 409);
+  }
+  issueSession(c, created.account.id);
+  return c.json({ user: toPublicAccount(created.account) }, 201);
+});
+
+app.post("/api/auth/login", async (c) => {
+  if (!allowAuthAttempt("login", clientIp(c))) return tooMany(c);
+  if (!gateOk(c)) return c.json({ error: "Invalid password" }, 401);
+  const body = await readJson(c);
+  if (!body) return badBody(c);
+  const name = cleanDisplayName(body.displayName);
+  const password = cleanPassword(body.password);
+  if (!name || !password) return c.json({ error: "Invalid username or password" }, 401);
+  const account = getAccountByNameKey(name.key);
+  const ok = await verifyPassword(password, account?.password_hash ?? null);
+  if (!account || !ok) return c.json({ error: "Invalid username or password" }, 401);
+  if (account.banned) return c.json({ error: "This account is disabled" }, 403);
+  issueSession(c, account.id);
+  return c.json({ user: toPublicAccount(account) });
+});
+
+app.post("/api/auth/logout", (c) => {
+  clearSessionCookie(c);
+  return c.json({ ok: true });
+});
+
+app.get("/api/auth/me", (c) => {
+  if (!gateOk(c)) return c.json({ error: "Invalid password" }, 401);
+  const account = sessionAccount(c);
+  if (!account) return c.json({ error: "Login required" }, 401);
+  if (account.banned) {
+    clearSessionCookie(c);
+    return c.json({ error: "This account is disabled" }, 403);
+  }
+  return c.json({ user: toPublicAccount(account) });
+});
+
+app.post("/api/time/log", accountAuth, (c) => {
+  const account = c.get("account");
+  const before = getViewer(account.viewerId);
+  const viewer = upsertViewer(account.viewerId, 1, REGULAR_THRESHOLD);
   const promoted = !!(before && !before.is_regular && viewer.is_regular);
   return c.json({
     viewer: viewerToJson(viewer),
@@ -141,26 +300,19 @@ app.post("/api/time/log", viewerAuth, async (c) => {
   });
 });
 
-app.post("/api/time/set-username", viewerAuth, async (c) => {
-  const body = await readJson(c);
-  if (!body) return badBody(c);
-  const viewerId = cleanViewerId(body.viewerId);
-  if (!viewerId) return c.json({ error: "valid viewerId (UUID) required" }, 400);
-  const username = cleanLine(body.username, MAX_USERNAME);
-  if (!username) return c.json({ error: `username required (1-${MAX_USERNAME} characters)` }, 400);
-  const viewer = setViewerUsername(viewerId, username);
-  return c.json({ viewer: viewerToJson(viewer) });
+app.post("/api/time/set-username", accountAuth, (c) => {
+  return c.json({ error: "Your display name is the username on your account." }, 400);
 });
 
-app.get("/api/time/viewer/:id", viewerAuth, (c) => {
+app.get("/api/time/viewer/:id", accountAuth, (c) => {
+  const account = c.get("account");
   const viewerId = cleanViewerId(c.req.param("id"));
-  if (!viewerId) return c.json({ error: "valid viewerId (UUID) required" }, 400);
+  if (!viewerId || viewerId !== account.viewerId) return c.json({ error: "Not found" }, 404);
   const viewer = getViewer(viewerId);
   return c.json({ viewer: viewer ? viewerToJson(viewer) : null });
 });
 
-// Requests
-app.get("/api/requests/search", viewerAuth, async (c) => {
+app.get("/api/requests/search", accountAuth, async (c) => {
   const q = c.req.query("q");
   if (!q) return c.json({ error: "Query required" }, 400);
   try {
@@ -172,11 +324,10 @@ app.get("/api/requests/search", viewerAuth, async (c) => {
   }
 });
 
-app.post("/api/requests/submit", viewerAuth, async (c) => {
+app.post("/api/requests/submit", accountAuth, async (c) => {
+  const account = c.get("account");
   const body = await readJson(c);
   if (!body) return badBody(c);
-  const viewerId = cleanViewerId(body.viewerId);
-  if (!viewerId) return c.json({ error: "valid viewerId (UUID) required" }, 400);
   const type = body.type;
   if (type !== "song" && type !== "message") {
     return c.json({ error: 'type must be "song" or "message"' }, 400);
@@ -201,11 +352,12 @@ app.post("/api/requests/submit", viewerAuth, async (c) => {
       spotifyUri = body.spotifyUri;
     }
   }
-  const viewer = getViewer(viewerId);
+  const viewer = getViewer(account.viewerId);
   const isRegular = viewer ? Boolean(viewer.is_regular) : false;
   const status = isRegular && type === "song" ? "approved" : "pending";
   const request = insertRequest({
-    viewer_id: viewerId,
+    viewer_id: account.viewerId,
+    user_id: account.id,
     type,
     content,
     spotify_uri: spotifyUri,
@@ -215,15 +367,15 @@ app.post("/api/requests/submit", viewerAuth, async (c) => {
   if (status === "approved" && type === "song" && spotifyUri) {
     try {
       await addToQueue(spotifyUri);
-      const username = viewer?.username || "Anonymous";
-      setOverlay(`Requested by ${username}: ${content}${artist ? ` - ${artist}` : ""}`);
+      setOverlay(`Requested by ${account.displayName}: ${content}${artist ? ` - ${artist}` : ""}`);
+      invalidateQueueCache();
     } catch (e) {
       console.error("Failed to add to Spotify queue:", e);
     }
   }
-  if (status === "approved") {
-    broadcast("request", request);
-  }
+  // Pending requests are included so the admin list can refresh immediately.
+  // The hub feed ignores anything that is not approved.
+  broadcast("request", request);
   return c.json({
     request,
     autoApproved: status === "approved",
@@ -231,12 +383,11 @@ app.post("/api/requests/submit", viewerAuth, async (c) => {
   });
 });
 
-app.get("/api/requests/approved", viewerAuth, (c) => {
+app.get("/api/requests/approved", accountAuth, (c) => {
   const requests = getApprovedRequests(50);
   return c.json({ requests });
 });
 
-// Admin
 app.get("/api/admin/requests", adminAuth, (c) => {
   const status = c.req.query("status");
   const requests = getRequests(status || undefined);
@@ -253,14 +404,13 @@ app.post("/api/admin/requests/:id/approve", adminAuth, async (c) => {
       await addToQueue(request.spotify_uri);
       const username = request.viewer?.username || "Anonymous";
       setOverlay(`Requested by ${username}: ${request.content}${request.artist ? ` - ${request.artist}` : ""}`);
+      invalidateQueueCache();
     } catch (e) {
       console.error("Failed to add to Spotify queue:", e);
     }
   }
   const updated: RequestWithViewer = { ...request, status: "approved" };
   broadcast("request", updated);
-  // Pass the pre-update request so a second approve does not speak it again.
-  // forwardApprovedMessage returns immediately; a down SSN cannot fail this response.
   try {
     forwardApprovedMessage(request);
   } catch (error) {
@@ -285,19 +435,56 @@ app.post("/api/admin/viewers/:id/toggle-regular", adminAuth, (c) => {
   return c.json({ viewer: viewerToJson(viewer) });
 });
 
+app.get("/api/admin/accounts", adminAuth, (c) => {
+  return c.json({ accounts: listAccounts() });
+});
+
+app.post("/api/admin/accounts/:id/ban", adminAuth, (c) => {
+  const id = cleanViewerId(c.req.param("id"));
+  if (!id) return c.json({ error: "valid account id required" }, 400);
+  const account = setAccountBanned(id, true);
+  if (!account) return c.json({ error: "Account not found" }, 404);
+  return c.json({ account });
+});
+
+app.post("/api/admin/accounts/:id/unban", adminAuth, (c) => {
+  const id = cleanViewerId(c.req.param("id"));
+  if (!id) return c.json({ error: "valid account id required" }, 400);
+  const account = setAccountBanned(id, false);
+  if (!account) return c.json({ error: "Account not found" }, 404);
+  return c.json({ account });
+});
+
+app.delete("/api/admin/accounts/:id", adminAuth, (c) => {
+  const id = cleanViewerId(c.req.param("id"));
+  if (!id) return c.json({ error: "valid account id required" }, 400);
+  if (!deleteAccount(id)) return c.json({ error: "Account not found" }, 404);
+  return c.json({ success: true });
+});
+
 app.post("/api/admin/overlay/clear", adminAuth, (c) => {
   clearOverlay();
   return c.json({ success: true });
 });
 
-// Overlay (no auth)
-app.get("/api/overlay/current", (c) => {
-  return new Response(getOverlay(), {
-    headers: { "Content-Type": "text/plain" },
+app.get("/api/overlay/current", async (c) => {
+  const nowPlaying = getOverlay();
+  let tracks: Awaited<ReturnType<typeof getUpcomingTracks>> = null;
+  try {
+    tracks = await getUpcomingTracks();
+  } catch {
+    tracks = null;
+  }
+  const credits = tracks && tracks.length > 0 ? getApprovedSongCredits() : [];
+  const body = buildOverlayText(nowPlaying, tracks, credits);
+  return new Response(body, {
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "no-store",
+    },
   });
 });
 
-// SSE
 app.get("/api/events", (c) => {
   const stream = new ReadableStream({
     start(controller) {
@@ -341,10 +528,12 @@ function chatStatus() {
 }
 
 function chatAuth(c: Context): boolean {
-  return (
-    passwordMatches(c.req.header("x-viewer-password"), VIEWER_PASSWORD) ||
-    passwordMatches(c.req.header("x-admin-password"), ADMIN_PASSWORD)
-  );
+  if (passwordMatches(c.req.header("x-admin-password"), ADMIN_PASSWORD)) return true;
+  if (siteGateEnabled() && passwordMatches(c.req.header("x-viewer-password"), process.env.VIEWER_PASSWORD ?? "")) {
+    return true;
+  }
+  const account = sessionAccount(c);
+  return !!account && !account.banned;
 }
 
 app.get("/api/health", (c) => c.json({ ok: true }));
@@ -404,7 +593,12 @@ app.get("/api/chat/stream", (c) => {
   });
 });
 
-app.get("/", (c) => c.html(htmlPage("WyldePhyre — Gate", GATE_BODY, GATE_SCRIPT)));
+app.get("/", (c) => {
+  if (c.req.query("admin") !== "true" && !siteGateEnabled()) return c.redirect("/login");
+  return c.html(htmlPage("WyldePhyre — Gate", GATE_BODY, GATE_SCRIPT));
+});
+app.get("/login", (c) => c.html(htmlPage("WyldePhyre — Account", LOGIN_BODY, LOGIN_SCRIPT)));
+app.get("/overlay", (c) => c.html(htmlPage("WyldePhyre — Overlay", OVERLAY_BODY, OVERLAY_SCRIPT)));
 app.get("/hub", (c) => c.html(htmlPage("WyldePhyre — Hub", HUB_BODY, HUB_SCRIPT)));
 app.get("/admin", (c) => c.html(htmlPage("WyldePhyre — Admin", ADMIN_BODY, ADMIN_SCRIPT)));
 
@@ -414,6 +608,5 @@ export default {
   port: PORT,
   hostname: "0.0.0.0",
   fetch: app.fetch,
-  // Bun's default idle timeout is 10s, which drops SSE. 0 disables it.
   idleTimeout: 0,
 };
