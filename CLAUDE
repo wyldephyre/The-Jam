@@ -10,3 +10,8 @@ Single-file Zo site. Stack: Hono + Bun + SQLite + SSE.
 API routes all start with /api. Three frontend pages: / (gate), /hub, /admin.
 Auth uses x-viewer-password and x-admin-password headers (env vars).
 Real-time updates are delivered via GET /api/events (SSE).
+
+Live chat is a server-side Social Stream Ninja relay (ssn.ts, ssn-relay.ts).
+SSN_SESSION_ID and SSN_PASSWORD stay on the server. The hub and admin render
+plain text only. Do not iframe socialstream.ninja with the session in the page.
+Deploy notes: docs/DEPLOY-ZO.md. Do not put secrets in zosite.json.

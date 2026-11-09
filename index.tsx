@@ -18,6 +18,8 @@ import {
 } from "./db";
 import { searchTracks, addToQueue } from "./spotify";
 import { addClient, removeClient, broadcast } from "./sse";
+import { chatHub } from "./ssn";
+import { getSsnRelay, startSsnRelay } from "./ssn-relay";
 import { htmlPage, GATE_BODY, GATE_SCRIPT, HUB_BODY, HUB_SCRIPT, ADMIN_BODY, ADMIN_SCRIPT } from "./pages";
 
 // Refuse to start without both passwords. An unset/empty password must never
@@ -312,6 +314,84 @@ app.get("/api/events", (c) => {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
+  });
+});
+
+function chatStatus() {
+  return (
+    getSsnRelay()?.status() ?? {
+      mode: "server-relay" as const,
+      configured: false,
+      connected: false,
+      state: "unconfigured" as const,
+      platforms: ["twitch", "youtube", "rumble", "x", "twitter"],
+      hideBots: false,
+    }
+  );
+}
+
+function chatAuth(c: Context): boolean {
+  return (
+    passwordMatches(c.req.header("x-viewer-password"), VIEWER_PASSWORD) ||
+    passwordMatches(c.req.header("x-admin-password"), ADMIN_PASSWORD)
+  );
+}
+
+app.get("/api/health", (c) => c.json({ ok: true }));
+
+app.get("/api/chat/status", (c) => {
+  if (!chatAuth(c)) return c.json({ error: "Invalid password" }, 401);
+  return c.json(chatStatus());
+});
+
+app.post("/api/chat/ticket", (c) => {
+  if (!chatAuth(c)) return c.json({ error: "Invalid password" }, 401);
+  return c.json(chatHub.issueTicket());
+});
+
+app.get("/api/chat/recent", (c) => {
+  if (!chatAuth(c)) return c.json({ error: "Invalid password" }, 401);
+  return c.json({ messages: chatHub.recent(50), status: chatStatus() });
+});
+
+app.get("/api/chat/stream", (c) => {
+  const ticket = c.req.query("ticket") ?? "";
+  if (!chatHub.validTicket(ticket)) return c.json({ error: "Invalid ticket" }, 401);
+  let unsubscribe = () => {};
+  let keepAlive: ReturnType<typeof setInterval> | undefined;
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    start(controller) {
+      const send = (event: string, data: unknown) => {
+        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+      };
+      unsubscribe = chatHub.subscribe(send);
+      try {
+        send("status", chatStatus());
+      } catch {
+        // The stream can close before the first write.
+      }
+      keepAlive = setInterval(() => {
+        try {
+          controller.enqueue(encoder.encode(": keep-alive\n\n"));
+        } catch {
+          if (keepAlive) clearInterval(keepAlive);
+        }
+      }, 20000);
+    },
+    cancel() {
+      if (keepAlive) clearInterval(keepAlive);
+      unsubscribe();
+    },
+  });
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-store",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
     },
   });
 });
@@ -320,7 +400,12 @@ app.get("/", (c) => c.html(htmlPage("WyldePhyre — Gate", GATE_BODY, GATE_SCRIP
 app.get("/hub", (c) => c.html(htmlPage("WyldePhyre — Hub", HUB_BODY, HUB_SCRIPT)));
 app.get("/admin", (c) => c.html(htmlPage("WyldePhyre — Admin", ADMIN_BODY, ADMIN_SCRIPT)));
 
+startSsnRelay();
+
 export default {
   port: PORT,
+  hostname: "0.0.0.0",
   fetch: app.fetch,
+  // Bun's default idle timeout is 10s, which drops SSE. 0 disables it.
+  idleTimeout: 0,
 };

@@ -1,4 +1,13 @@
 {
   "name": "the-jam",
-  "description": "WyldePhyre Viewer Hub — multi-platform stream interaction site"
+  "description": "WyldePhyre Viewer Hub — multi-platform stream interaction site",
+  "entrypoint": "bun run dev",
+  "publish": {
+    "label": "the-jam",
+    "type": "http",
+    "entrypoint": "bun run start",
+    "env": {
+      "NODE_ENV": "production"
+    }
+  }
 }
